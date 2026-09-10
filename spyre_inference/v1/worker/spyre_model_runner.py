@@ -355,6 +355,115 @@ class _SpyreModelWrapper:
         hidden_states = convert(hidden_states, device=self._spyre_device)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
 
+    def embed_multimodal(self, **kwargs):
+        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
+        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
+        input conversion, so pixel tensors would otherwise arrive on CPU while the
+        vision weights are on Spyre.
+        """
+        def _to_spyre_float(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                return convert(t, dtype=torch.float16, device=self._spyre_device)
+            return t
+
+        kwargs = tree_map(_to_spyre_float, kwargs)
+        return self._model.embed_multimodal(**kwargs)
+
+    def embed_input_ids(
+        self,
+        input_ids,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal=None,
+        **kwargs,
+    ):
+        """Text-token embedding + multimodal merge, Spyre-aware.
+
+        Two paths:
+        - Model has its own embed_input_ids that handles multimodal merging
+          (e.g. Granite4Vision with packed deepstack tensors): pass everything
+          through directly after converting input_ids to Spyre int64.
+          The model's own index-put (target[is_multimodal] = ...) runs on CPU
+          because Spyre cannot do boolean-mask scatter in place.
+        - Generic models that rely on _merge_multimodal_embeddings: run the
+          text embedding on Spyre, then do the merge on CPU.
+        """
+        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+
+        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+
+        # Check whether the underlying model's embed_input_ids accepts
+        # multimodal_embeddings itself (i.e. handles the merge internally).
+        import inspect
+        model_embed_sig = inspect.signature(self._model.embed_input_ids)
+        model_owns_merge = "multimodal_embeddings" in model_embed_sig.parameters
+
+        if model_owns_merge:
+            # Delegate fully to the model's own embed_input_ids.
+            # The model body uses boolean-mask index-put ops
+            # (e.g. text_embeds[is_multimodal] = 0.0, target[is_multimodal] = ...)
+            # that Spyre does not support.  Only the token embedding lookup
+            # (language_model.model.embed_tokens) needs weights on CPU; moving
+            # the whole model would be prohibitively expensive.
+            input_ids_cpu = convert(input_ids, device="cpu")
+            mm_embeds_cpu = tree_map(
+                lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+                multimodal_embeddings,
+            ) if has_mm else multimodal_embeddings
+            is_multimodal_cpu = (
+                is_multimodal.to("cpu")
+                if isinstance(is_multimodal, torch.Tensor)
+                else is_multimodal
+            )
+            # Move only the token embedding table to CPU; restore after.
+            embed_tokens = getattr(
+                getattr(getattr(self._model, "language_model", None), "model", None),
+                "embed_tokens", None,
+            )
+            if embed_tokens is not None:
+                embed_tokens.to("cpu")
+            try:
+                result = self._model.embed_input_ids(
+                    input_ids_cpu,
+                    multimodal_embeddings=mm_embeds_cpu,
+                    is_multimodal=is_multimodal_cpu,
+                    **kwargs,
+                )
+            finally:
+                if embed_tokens is not None:
+                    embed_tokens.to(self._spyre_device)
+                # _ds_buffers auto-migrate to inputs_embeds.device inside
+                # embed_input_ids (granite4_vision.py line ~854).  Since we
+                # ran on CPU they are now on CPU; move them back to Spyre so
+                # GraniteModel.forward can add them to Spyre hidden_states.
+                ds_buffers = getattr(self._model, "_ds_buffers", None)
+                if ds_buffers is not None:
+                    self._model._ds_buffers = [
+                        convert(b, dtype=torch.float16, device=self._spyre_device)
+                        for b in ds_buffers
+                    ]
+            return convert(result, device=self._spyre_device)
+
+        # Generic path: model.embed_input_ids only does text embedding.
+        inputs_embeds = self._model.embed_input_ids(input_ids, **kwargs)
+
+        if not has_mm:
+            return inputs_embeds
+
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        inputs_embeds_cpu = convert(inputs_embeds, device="cpu")
+        mm_embeds_cpu = tree_map(
+            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+            multimodal_embeddings,
+        )
+        merged = _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds_cpu,
+            multimodal_embeddings=mm_embeds_cpu,
+            is_multimodal=is_multimodal.to("cpu") if isinstance(is_multimodal, torch.Tensor) else is_multimodal,
+        )
+        return convert(merged, device=self._spyre_device)
+
     def __getattr__(self, name):
         return getattr(self._model, name)
 
@@ -462,6 +571,143 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+
+        # Wrap any SiglipVisionEmbeddings.forward under torch.compile so that
+        # aten.embedding(position_embedding.weight, position_ids) is never called
+        # eagerly on Spyre tensors.  torch-spyre's compile_once eager kernel for
+        # aten.embedding compiles torch.compile(aten.embedding); when Dynamo then
+        # traces that compiled op it re-evaluates get_fake_value by running the op
+        # again, re-entering the same registered kernel → RecursionError.
+        # Compiling the entire embeddings forward keeps both weight and position_ids
+        # on Spyre and lets inductor lower aten.embedding directly without going
+        # through the eager dispatch path.
+        try:
+            from vllm.model_executor.models.siglip import SiglipVisionEmbeddings
+            spyre_device = self._spyre_device
+
+            def _siglip_embeddings_forward(
+                self: SiglipVisionEmbeddings,
+                pixel_values: torch.Tensor,
+                interpolate_pos_encoding: bool = False,
+            ) -> torch.Tensor:
+                _, _, height, width = pixel_values.shape
+                target_dtype = self.patch_embedding.weight.dtype
+                patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
+                embeddings = patch_embeds.flatten(2).transpose(1, 2)
+                if interpolate_pos_encoding:
+                    embeddings += self.interpolate_pos_encoding(embeddings, height, width)
+                else:
+                    # Both the embedding lookup and the add run on CPU to avoid
+                    # torch-spyre's compile_once re-entrancy (aten.embedding and
+                    # aten.add both hit compile_once when called eagerly on Spyre).
+                    pos_emb = self.position_embedding(self.position_ids)
+                    embeddings = (embeddings.to("cpu") + pos_emb).to(spyre_device)
+                return embeddings
+
+            for module in self.model.modules():
+                if isinstance(module, SiglipVisionEmbeddings):
+                    module.position_embedding.to("cpu")
+                    module.register_buffer(
+                        "position_ids",
+                        module.position_ids.to("cpu"),
+                        persistent=False,
+                    )
+                    module.forward = _siglip_embeddings_forward.__get__(module)  # ty: ignore[method-assign]
+        except ImportError:
+            pass
+
+        try:
+            from vllm.model_executor.models.granite4_vision import InterpolateDownsampler
+
+            if not getattr(InterpolateDownsampler.__call__, "_spyre_patched", False):
+                def _interpolate_downsampler_call(
+                    self: InterpolateDownsampler,
+                    image_features: torch.Tensor,
+                ) -> torch.Tensor:
+                    # InterpolateDownsampler uses F.interpolate(mode="area") which
+                    # lowers to aten::_adaptive_avg_pool2d — not supported on Spyre.
+                    # The permute/view/mean involves non-contiguous strides that
+                    # copy_from_d2d cannot restickify on-device, so run on CPU.
+                    dev = image_features.device
+                    image_features_cpu = convert(image_features, device="cpu")
+                    batch_size, _, dim = image_features_cpu.size()
+                    up_shape = [batch_size, self.orig_image_side, self.orig_image_side, dim]
+                    large = image_features_cpu.view(up_shape).permute(0, 3, 1, 2)
+                    small = torch.nn.functional.adaptive_avg_pool2d(
+                        large, (self.new_image_side, self.new_image_side)
+                    )
+                    out_cpu = small.permute(0, 2, 3, 1).flatten(1, 2)
+                    return convert(out_cpu, device=dev)
+
+                _interpolate_downsampler_call._spyre_patched = True  # type: ignore[attr-defined]
+                InterpolateDownsampler.__call__ = _interpolate_downsampler_call  # type: ignore[method-assign]
+                logger.info("Spyre: patched InterpolateDownsampler to run on CPU (permute/mean not restickifiable on Spyre).")
+        except ImportError:
+            pass
+
+        try:
+            from vllm.model_executor.models.granite4_vision import Granite4VisionForConditionalGeneration
+
+            if not getattr(Granite4VisionForConditionalGeneration._pack_and_unpad_image_features,
+                           "_spyre_patched", False):
+                _orig_pack_and_unpad = Granite4VisionForConditionalGeneration._pack_and_unpad_image_features
+
+                def _pack_and_unpad_cpu(self, image_features, image_sizes):
+                    # permute(4,0,2,1,3) on a 5-D tensor produces a stick
+                    # expression (e.g. 12*d1+d2) that Spyre's work_division
+                    # pass cannot lower.  No parameters touched — run on CPU.
+                    dev = image_features[0].device if image_features else None
+                    image_features_cpu = [convert(f, device="cpu") for f in image_features]
+                    image_sizes_cpu = convert(image_sizes, device="cpu")
+                    result_cpu = _orig_pack_and_unpad(self, image_features_cpu, image_sizes_cpu)
+                    if dev is not None and dev.type != "cpu":
+                        result_cpu = [convert(f, device=dev) for f in result_cpu]
+                    return result_cpu
+
+                _pack_and_unpad_cpu._spyre_patched = True  # type: ignore[attr-defined]
+                Granite4VisionForConditionalGeneration._pack_and_unpad_image_features = _pack_and_unpad_cpu  # type: ignore[method-assign]
+                logger.info("Spyre: patched Granite4VisionForConditionalGeneration._pack_and_unpad_image_features "
+                            "to run on CPU (5-D permute not lowerable on Spyre).")
+        except ImportError:
+            pass
+
+        try:
+            from vllm.model_executor.models.blip2 import Blip2QFormerMultiHeadAttention
+
+            if not getattr(Blip2QFormerMultiHeadAttention.forward,
+                           "_spyre_patched", False):
+                _orig_blip2_attn_forward = Blip2QFormerMultiHeadAttention.forward
+
+                def _blip2_attn_forward_cpu(self, hidden_states, encoder_hidden_states=None):
+                    # The full forward contains permute/matmul/softmax chains that
+                    # produce non-contiguous layouts Spyre's restickify and
+                    # bmm_padding passes cannot reconcile.  Run entirely on CPU.
+                    # Weights (query/key/value linears) live on Spyre, so we move
+                    # the whole module to CPU for the call and restore it after.
+                    target_device = hidden_states.device
+                    hidden_states = convert(hidden_states, device="cpu")
+                    if encoder_hidden_states is not None:
+                        encoder_hidden_states = convert(encoder_hidden_states, device="cpu")
+                    self.to("cpu")
+                    try:
+                        out = _orig_blip2_attn_forward(self, hidden_states, encoder_hidden_states)
+                    finally:
+                        self.to(target_device)
+                    return convert(out, device=target_device)
+
+                _blip2_attn_forward_cpu._spyre_patched = True  # type: ignore[attr-defined]
+                Blip2QFormerMultiHeadAttention.forward = _blip2_attn_forward_cpu  # type: ignore[method-assign]
+                logger.info("Spyre: patched Blip2QFormerMultiHeadAttention.forward "
+                            "to run on CPU (permute/matmul chains not restickifiable on Spyre).")
+        except ImportError:
+            pass
+
+        # Move plain tensor buffers (e.g. Granite4Vision _ds_buffers) to Spyre device.
+        if hasattr(self.model, "_ds_buffers"):
+            self.model._ds_buffers = [
+                convert(b, dtype=self.dtype, device=self._spyre_device)
+                for b in self.model._ds_buffers
+            ]
 
         # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
         # FP32 linear heads stay on CPU.

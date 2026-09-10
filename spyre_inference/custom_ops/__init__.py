@@ -20,9 +20,11 @@ from vllm.logger import init_logger
 
 from . import (
     activation,  # noqa: F401
+    conv,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
+    mm_encoder_attention,  # noqa: F401
     parallel_lm_head,
     rms_norm,
     rotary_embedding,
