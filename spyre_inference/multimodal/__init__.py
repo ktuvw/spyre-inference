@@ -22,6 +22,7 @@ implementations by layer class.
 import torch
 
 from . import clip, gemma4_vision, pixtral
+from . import blip2, granite4_vision, siglip
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -43,6 +44,9 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
             gemma4_vision.apply(model, device)
         else:
             pixtral.apply(model, device)
+            siglip.apply(model, device)
+            granite4_vision.apply(model, device)
+            blip2.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
     # Gated on model_type, not just attribute presence: other architectures (e.g.

@@ -27,6 +27,7 @@ from . import (
     layer_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
+    mm_encoder_attention,  # noqa: F401
     multimodal_embeddings,
     parallel_lm_head,
     rotary_embedding,
