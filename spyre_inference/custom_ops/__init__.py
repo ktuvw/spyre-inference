@@ -27,6 +27,7 @@ from . import (
     gemma_rms_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
+    mm_encoder_attention,  # noqa: F401
     parallel_lm_head,
     rms_norm,
     rotary_embedding,
