@@ -154,8 +154,11 @@ def test_patched_forward_with_cross_attention_matches_stock(tp_group):
 
     patch_blip2_qformer_attention()
 
+    # encoder_hidden_size must match hidden_size so the cross-attention key/value
+    # projections (in_features=encoder_hidden_size) accept our test tensors.
     config = Blip2QFormerConfig(
         hidden_size=HIDDEN_SIZE,
+        encoder_hidden_size=HIDDEN_SIZE,
         num_attention_heads=NUM_HEADS,
         attention_probs_dropout_prob=0.0,
     )
