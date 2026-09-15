@@ -314,3 +314,91 @@ def test_pad_weight_splits_a_fused_qkv_projection():
     v_out = v.view(n_kv, _PADDED, hidden)
     assert torch.equal(v_out[:, :_ORIG], v_src)
     assert not v_out[:, _ORIG:].any()
+
+
+# ---------------------------------------------------------------------------
+# Granite Vision 4.1 — SigLIP attention head_dim=72 padded to 128
+# ---------------------------------------------------------------------------
+# SigLIP-SO400M/patch-14 (Granite Vision 4.1-4B vision encoder):
+#   hidden_size=1152, num_heads=16  →  head_dim = 1152 // 16 = 72
+# The platform pads 72 → 128 (next multiple of 64 that is stick-aligned).
+_GV_ORIG, _GV_PADDED = 72, 128
+
+
+def test_pad_weight_siglip_q_proj_interleaves_rope_dims():
+    """SigLIP's Q projection uses RoPE, so it gets the same interleaved layout
+    as Llama/Granite text Q weights: first half of each head in rows 0..half,
+    second half in rows padded_half..padded_half+half, zeros in the gap."""
+    n_heads, hidden = 16, 1152
+    rows = n_heads * _GV_ORIG
+    w = torch.arange(float(rows * hidden)).reshape(rows, hidden)
+
+    out = _pad_weight("layers.0.self_attn.q_proj.weight", w, n_heads, n_heads, _GV_ORIG, _GV_PADDED)
+
+    assert out.shape == (n_heads * _GV_PADDED, hidden)
+    half, padded_half = _GV_ORIG // 2, _GV_PADDED // 2
+    q_src = w.view(n_heads, _GV_ORIG, hidden)
+    q_out = out.view(n_heads, _GV_PADDED, hidden)
+
+    assert torch.equal(q_out[:, :half], q_src[:, :half])
+    assert torch.equal(q_out[:, padded_half : padded_half + half], q_src[:, half:])
+    # Gap between the two real halves must be zero.
+    assert not q_out[:, half:padded_half].any()
+    assert not q_out[:, padded_half + half :].any()
+
+
+def test_pad_weight_siglip_v_proj_end_pads():
+    """SigLIP's V projection carries no RoPE, so it is end-padded with zeros —
+    same rule as the V slice of a fused QKV."""
+    n_heads, hidden = 16, 1152
+    rows = n_heads * _GV_ORIG
+    w = torch.arange(float(rows * hidden)).reshape(rows, hidden)
+
+    out = _pad_weight("layers.0.self_attn.v_proj.weight", w, n_heads, n_heads, _GV_ORIG, _GV_PADDED)
+
+    assert out.shape == (n_heads * _GV_PADDED, hidden)
+    v_src = w.view(n_heads, _GV_ORIG, hidden)
+    v_out = out.view(n_heads, _GV_PADDED, hidden)
+
+    assert torch.equal(v_out[:, :_GV_ORIG], v_src)
+    assert not v_out[:, _GV_ORIG:].any()
+
+
+def test_pad_weight_siglip_rmsnorm_reproduces_original():
+    """End-to-end: RMSNorm over a padded SigLIP Q head equals the original.
+
+    SigLIP 4.1 uses per-head Q/K norm (head_dim=72 padded to 128).  The
+    padded norm weight must give the same values on the real dims as the
+    unpadded weight gives on the unpadded head.
+    """
+    torch.manual_seed(42)
+    q = torch.randn(_GV_ORIG)
+    w = torch.randn(_GV_ORIG)
+
+    ref = F.rms_norm(q, (_GV_ORIG,), w, eps=1e-6)
+
+    # q and its norm weight padded as the weight loader does.
+    q_padded = _pad_weight(
+        "q_proj.weight", q.view(_GV_ORIG, 1), 1, 1, _GV_ORIG, _GV_PADDED
+    ).view(_GV_PADDED)
+    w_padded = _pad_weight("q_norm.weight", w, 1, 1, _GV_ORIG, _GV_PADDED)
+    out = F.rms_norm(q_padded, (_GV_PADDED,), w_padded, eps=1e-6)
+
+    half, padded_half = _GV_ORIG // 2, _GV_PADDED // 2
+    assert torch.allclose(out[:half], ref[:half], atol=1e-5)
+    assert torch.allclose(out[padded_half : padded_half + half], ref[half:], atol=1e-5)
+    assert not out[half:padded_half].any()
+    assert not out[padded_half + half :].any()
+
+
+def test_fix_scale_corrects_siglip_attention_scale():
+    """The attention scale 1/sqrt(head_dim) is set from the padded width (128)
+    but must equal 1/sqrt(72) — the original SigLIP head_dim."""
+    model, layer = _attention_with_scale(impl_scale=_GV_PADDED**-0.5)
+
+    fix_padded_attention_scale(
+        model,
+        SimpleNamespace(head_dim=_GV_PADDED, _spyre_orig_head_dim=_GV_ORIG),
+    )
+
+    assert layer.impl.scale == pytest.approx(_GV_ORIG**-0.5)
