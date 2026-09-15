@@ -99,9 +99,11 @@ class _MinimalGranite4VisionModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.image_newline = None  # single-patch branch: only checked for None
-        # _pack_and_unpad_image_features reads self.config unconditionally on
-        # entry, before branching on image_feature.shape[0].
+        # _pack_and_unpad_image_features reads self.config and self._downsample_rate
+        # unconditionally on entry, before branching on image_feature.shape[0].
         self.config = _MinimalDownsamplerConfig()
+        from fractions import Fraction
+        self._downsample_rate = float(Fraction(_DOWNSAMPLE_RATE))  # 0.5
 
     def pack_and_unpad(self, image_features, image_sizes):
         cls = granite4_vision.Granite4VisionForConditionalGeneration
