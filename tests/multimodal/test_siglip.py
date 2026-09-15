@@ -59,9 +59,9 @@ def _make_siglip_embeddings(device: torch.device = torch.device("cpu")) -> nn.Mo
         num_channels=IN_CHANNELS,
     )
     emb = siglip.SiglipVisionEmbeddings(config).to(torch.float16).to(device)
-    torch.manual_seed(0)
+    rng = torch.Generator(device="cpu").manual_seed(0)
     for p in emb.parameters():
-        p.data.normal_(std=0.02)
+        p.data.copy_(torch.empty_like(p.data, device="cpu").normal_(std=0.02, generator=rng))
     return emb
 
 
@@ -202,8 +202,8 @@ def test_patched_forward_output_matches_stock():
     on CPU — the only change is routing the position-embed add through CPU."""
     from spyre_inference.multimodal.siglip import patch_siglip_vision_embeddings
 
-    torch.manual_seed(1)
-    pixel_values = torch.randn(1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(1)
+    pixel_values = torch.randn(1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng)
 
     # Reference: stock forward on an unpatched instance.
     emb_stock = _make_siglip_embeddings()
@@ -237,8 +237,8 @@ def test_patched_forward_output_matches_cpu_on_spyre():
 
     from spyre_inference.multimodal.siglip import patch_siglip_vision_embeddings
 
-    torch.manual_seed(3)
-    pixel_values = torch.randn(1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(3)
+    pixel_values = torch.randn(1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng)
 
     # CPU reference with patched forward.
     emb_cpu = _make_siglip_embeddings()

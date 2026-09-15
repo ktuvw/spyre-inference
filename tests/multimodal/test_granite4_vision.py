@@ -43,6 +43,22 @@ ORIG_IMAGE_SIDE = 24
 NEW_IMAGE_SIDE = 12
 FEATURE_DIM = 1152  # SigLIP hidden size
 
+# Matches Granite Vision 4.1-4B: image_size=336, patch_size=14, downsample_rate=1/2
+# orig_image_side = 336 // 14 = 24; new_image_side = 24 * (1/2) = 12
+_VISION_IMAGE_SIZE = 336
+_VISION_PATCH_SIZE = 14
+_DOWNSAMPLE_RATE = "1/2"
+
+
+class _MinimalVisionConfig:
+    image_size = _VISION_IMAGE_SIZE
+    patch_size = _VISION_PATCH_SIZE
+
+
+class _MinimalDownsamplerConfig:
+    vision_config = _MinimalVisionConfig()
+    downsample_rate = _DOWNSAMPLE_RATE
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,18 +66,18 @@ FEATURE_DIM = 1152  # SigLIP hidden size
 
 
 def _make_interpolate_downsampler() -> nn.Module:
-    """Instantiate a real InterpolateDownsampler."""
+    """Instantiate a real InterpolateDownsampler using a minimal config."""
     cls = getattr(granite4_vision, "InterpolateDownsampler", None)
     if cls is None:
         pytest.skip("InterpolateDownsampler not present in this vLLM version")
-    return cls(orig_image_side=ORIG_IMAGE_SIDE, new_image_side=NEW_IMAGE_SIDE)
+    return cls(_MinimalDownsamplerConfig())
 
 
 def _make_image_features(batch: int = 1) -> torch.Tensor:
     """Flat image feature tensor `[batch, orig_side^2, dim]` as produced by
     the SigLIP encoder before the downsampler."""
-    torch.manual_seed(0)
-    return torch.randn(batch, ORIG_IMAGE_SIDE**2, FEATURE_DIM, dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(0)
+    return torch.randn(batch, ORIG_IMAGE_SIDE**2, FEATURE_DIM, dtype=torch.float16, generator=rng)
 
 
 def _make_dummy_model() -> nn.Module:
@@ -69,6 +85,24 @@ def _make_dummy_model() -> nn.Module:
     m = nn.Module()
     m.vision_tower = nn.Module()
     return m
+
+
+class _MinimalGranite4VisionModel(nn.Module):
+    """Wraps `Granite4VisionForConditionalGeneration._pack_and_unpad_image_features`
+    as a bare instance call without instantiating the full model.
+
+    Uses single-patch inputs (image_feature.shape[0] == 1) so only
+    `self.image_newline` is needed — the multi-patch branch additionally
+    reads `self.config`, `self._downsample_rate`, etc.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.image_newline = None  # single-patch branch: only checked for None
+
+    def pack_and_unpad(self, image_features, image_sizes):
+        cls = granite4_vision.Granite4VisionForConditionalGeneration
+        return cls._pack_and_unpad_image_features(self, image_features, image_sizes)
 
 
 # ---------------------------------------------------------------------------
@@ -210,26 +244,23 @@ def test_interpolate_downsampler_output_shape(batch_size):
 
 def _make_pack_and_unpad_inputs(num_images: int = 1):
     """Build minimal `image_features` and `image_sizes` for
-    `_pack_and_unpad_image_features`. Each image is already downsampled to
-    `NEW_IMAGE_SIDE^2` tokens."""
+    `_pack_and_unpad_image_features`.
+
+    Each entry has shape `[1, NEW_IMAGE_SIDE^2, FEATURE_DIM]` — the leading
+    dimension of 1 selects the single-patch branch in the method, which only
+    reads `self.image_newline` (set to None in `_MinimalGranite4VisionModel`).
+    The multi-patch branch additionally requires `self.config`,
+    `self._downsample_rate`, etc., which a minimal stub cannot provide.
+    """
     image_features = [
         torch.randn(1, NEW_IMAGE_SIDE**2, FEATURE_DIM, dtype=torch.float16)
         for _ in range(num_images)
     ]
-    # image_sizes: (H, W) in original pixels — only the ratio matters for packing.
+    # image_sizes: (H, W) in original pixels — only read in the multi-patch branch.
     image_sizes = torch.tensor(
         [[336, 336]] * num_images, dtype=torch.long
     )
     return image_features, image_sizes
-
-
-class _MinimalGranite4VisionModel(nn.Module):
-    """Wraps `Granite4VisionForConditionalGeneration._pack_and_unpad_image_features`
-    as a bare classmethod call without instantiating the full model."""
-
-    def pack_and_unpad(self, image_features, image_sizes):
-        cls = granite4_vision.Granite4VisionForConditionalGeneration
-        return cls._pack_and_unpad_image_features(self, image_features, image_sizes)
 
 
 @pytest.mark.granite4_vision

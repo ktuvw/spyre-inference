@@ -65,12 +65,12 @@ def _make_qformer_attention(tp_group) -> nn.Module:
         num_attention_heads=NUM_HEADS,
         attention_probs_dropout_prob=0.0,
     )
-    attn = blip2.Blip2QFormerMultiHeadAttention(config, is_cross_attention=False).to(
-        torch.float16
-    )
-    torch.manual_seed(0)
+    attn = blip2.Blip2QFormerMultiHeadAttention(
+        config, quant_config=None, cache_config=None, is_cross_attention=False
+    ).to(torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(0)
     for p in attn.parameters():
-        p.data.normal_(std=0.02)
+        p.data.copy_(torch.empty_like(p.data, device="cpu").normal_(std=0.02, generator=rng))
     _finish_weight_loading(attn)
     return attn
 
@@ -129,7 +129,7 @@ def test_patched_forward_output_matches_stock(tp_group):
     forward on CPU — moving to CPU and back must not change values."""
     from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
 
-    torch.manual_seed(1)
+    rng = torch.Generator(device="cpu").manual_seed(1)
     seq_len = 8
     hidden_states = torch.randn(1, seq_len, HIDDEN_SIZE, dtype=torch.float16)
 
@@ -159,12 +159,12 @@ def test_patched_forward_with_cross_attention_matches_stock(tp_group):
         num_attention_heads=NUM_HEADS,
         attention_probs_dropout_prob=0.0,
     )
-    attn = blip2.Blip2QFormerMultiHeadAttention(config, is_cross_attention=True).to(
-        torch.float16
-    )
-    torch.manual_seed(2)
+    attn = blip2.Blip2QFormerMultiHeadAttention(
+        config, quant_config=None, cache_config=None, is_cross_attention=True
+    ).to(torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(2)
     for p in attn.parameters():
-        p.data.normal_(std=0.02)
+        p.data.copy_(torch.empty_like(p.data, device="cpu").normal_(std=0.02, generator=rng))
     _finish_weight_loading(attn)
 
     hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
@@ -222,8 +222,8 @@ def test_patched_forward_output_matches_cpu_on_spyre(tp_group):
 
     patch_blip2_qformer_attention()
 
-    torch.manual_seed(5)
-    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
+    rng = torch.Generator(device="cpu").manual_seed(5)
+    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
 
     attn_cpu = _make_qformer_attention(tp_group)
     expected = blip2.Blip2QFormerMultiHeadAttention.forward(attn_cpu, hidden_states)
