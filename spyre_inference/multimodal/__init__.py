@@ -21,8 +21,16 @@ implementations by layer class.
 
 import torch
 
-from . import clip, gemma4_vision, pixtral
+from . import pixtral
 from . import blip2, granite4_vision, siglip
+from . import (
+    clip,
+    blip2,
+    gemma4_vision,
+    granite4_vision,
+    pixtral,
+    siglip,
+)
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:

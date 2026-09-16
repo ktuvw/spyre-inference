@@ -82,9 +82,7 @@ def patch_pack_and_unpad_image_features() -> None:
     ):
         return
 
-    _orig_pack_and_unpad = (
-        Granite4VisionForConditionalGeneration._pack_and_unpad_image_features
-    )
+    _orig_pack_and_unpad = Granite4VisionForConditionalGeneration._pack_and_unpad_image_features
 
     def _pack_and_unpad_cpu(self, image_features, image_sizes):
         dev = image_features[0].device if image_features else None

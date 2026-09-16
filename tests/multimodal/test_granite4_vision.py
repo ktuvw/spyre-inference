@@ -103,6 +103,7 @@ class _MinimalGranite4VisionModel(nn.Module):
         # unconditionally on entry, before branching on image_feature.shape[0].
         self.config = _MinimalDownsamplerConfig()
         from fractions import Fraction
+
         self._downsample_rate = float(Fraction(_DOWNSAMPLE_RATE))  # 0.5
 
     def pack_and_unpad(self, image_features, image_sizes):
@@ -262,9 +263,7 @@ def _make_pack_and_unpad_inputs(num_images: int = 1):
         for _ in range(num_images)
     ]
     # image_sizes: (H, W) in original pixels — only read in the multi-patch branch.
-    image_sizes = torch.tensor(
-        [[336, 336]] * num_images, dtype=torch.long
-    )
+    image_sizes = torch.tensor([[336, 336]] * num_images, dtype=torch.long)
     return image_features, image_sizes
 
 

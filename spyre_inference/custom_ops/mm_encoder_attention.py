@@ -17,7 +17,6 @@
 import einops
 import torch
 import torch.nn.functional as F
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 

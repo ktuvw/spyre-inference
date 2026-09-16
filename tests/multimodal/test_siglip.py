@@ -118,8 +118,7 @@ def test_siglip_vision_embeddings_has_position_embedding_and_ids():
         "the patch calls `module.position_embedding.to('cpu')`"
     )
     assert hasattr(emb, "position_ids"), (
-        "SiglipVisionEmbeddings has no `position_ids` — "
-        "the patch re-registers it as a CPU buffer"
+        "SiglipVisionEmbeddings has no `position_ids` — the patch re-registers it as a CPU buffer"
     )
 
 
@@ -203,7 +202,9 @@ def test_patched_forward_output_matches_stock():
     from spyre_inference.multimodal.siglip import patch_siglip_vision_embeddings
 
     rng = torch.Generator(device="cpu").manual_seed(1)
-    pixel_values = torch.randn(1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng)
+    pixel_values = torch.randn(
+        1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng
+    )
 
     # Reference: stock forward on an unpatched instance.
     emb_stock = _make_siglip_embeddings()
@@ -238,7 +239,9 @@ def test_patched_forward_output_matches_cpu_on_spyre():
     from spyre_inference.multimodal.siglip import patch_siglip_vision_embeddings
 
     rng = torch.Generator(device="cpu").manual_seed(3)
-    pixel_values = torch.randn(1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng)
+    pixel_values = torch.randn(
+        1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng
+    )
 
     # CPU reference with patched forward.
     emb_cpu = _make_siglip_embeddings()

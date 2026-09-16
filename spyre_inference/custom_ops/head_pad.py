@@ -198,7 +198,9 @@ def install_padded_head_dim(model_config) -> None:
     modules = set()
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     if architectures:
-        model_cls, _ = model_config.registry.resolve_model_cls(architectures, model_config=model_config)
+        model_cls, _ = model_config.registry.resolve_model_cls(
+            architectures, model_config=model_config
+        )
         if model_cls and sys.modules.get(model_cls.__module__):
             modules.add(sys.modules[model_cls.__module__])
 

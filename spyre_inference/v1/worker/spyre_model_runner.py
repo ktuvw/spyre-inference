@@ -500,6 +500,7 @@ class _SpyreModelWrapper:
         # Check whether the underlying model's embed_input_ids accepts
         # multimodal_embeddings itself (i.e. handles the merge internally).
         import inspect
+
         model_embed_sig = inspect.signature(self._model.embed_input_ids)
         model_owns_merge = "multimodal_embeddings" in model_embed_sig.parameters
 
@@ -515,6 +516,7 @@ class _SpyreModelWrapper:
                 lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
                 multimodal_embeddings,
             ) if has_mm else multimodal_embeddings
+
             is_multimodal_cpu = (
                 is_multimodal.to("cpu")
                 if isinstance(is_multimodal, torch.Tensor)
@@ -719,7 +721,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Patches instances, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.
-        #apply_multimodal_patches(self.model, self._spyre_device)
+        # apply_multimodal_patches(self.model, self._spyre_device)
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
