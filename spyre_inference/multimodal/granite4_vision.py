@@ -58,7 +58,8 @@ def patch_interpolate_downsampler() -> None:
     _interpolate_downsampler_call._spyre_patched = True  # type: ignore[attr-defined]
     InterpolateDownsampler.__call__ = _interpolate_downsampler_call  # type: ignore[method-assign]
     logger.info(
-        "Spyre: patched InterpolateDownsampler to run on CPU (permute/mean not restickifiable on Spyre)."
+        "Spyre: patched InterpolateDownsampler to run on CPU"
+        " (permute/mean not restickifiable on Spyre)."
     )
 
 
