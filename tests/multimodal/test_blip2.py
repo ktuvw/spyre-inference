@@ -129,7 +129,6 @@ def test_patched_forward_output_matches_stock(tp_group):
     forward on CPU — moving to CPU and back must not change values."""
     from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
 
-    rng = torch.Generator(device="cpu").manual_seed(1)
     seq_len = 8
     hidden_states = torch.randn(1, seq_len, HIDDEN_SIZE, dtype=torch.float16)
 

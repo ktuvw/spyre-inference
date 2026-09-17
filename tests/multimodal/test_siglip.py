@@ -45,11 +45,13 @@ IN_CHANNELS = 3
 # ---------------------------------------------------------------------------
 
 
-def _make_siglip_embeddings(device: torch.device = torch.device("cpu")) -> nn.Module:
+def _make_siglip_embeddings(device: torch.device | None = None) -> nn.Module:
     """Instantiate a real SiglipVisionEmbeddings with small deterministic weights.
 
     Uses the actual class so the patch target is a genuine instance.
     """
+    if device is None:
+        device = torch.device("cpu")
     from vllm.model_executor.models.siglip import SiglipVisionConfig
 
     config = SiglipVisionConfig(
@@ -65,7 +67,7 @@ def _make_siglip_embeddings(device: torch.device = torch.device("cpu")) -> nn.Mo
     return emb
 
 
-def _make_model_with_siglip(device: torch.device = torch.device("cpu")) -> nn.Module:
+def _make_model_with_siglip(device: torch.device | None = None) -> nn.Module:
     """Wrap a SiglipVisionEmbeddings inside a parent module to exercise the
     `model.modules()` traversal in `patch_siglip_vision_embeddings`."""
     model = nn.Module()
