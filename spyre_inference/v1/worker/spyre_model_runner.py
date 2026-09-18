@@ -54,6 +54,7 @@ from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
@@ -403,12 +404,17 @@ class _SpyreModelWrapper:
         """
         has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
 
-        # Check whether the underlying model's embed_input_ids accepts
-        # multimodal_embeddings itself (i.e. handles the merge internally).
-        import inspect
-
-        model_embed_sig = inspect.signature(self._model.embed_input_ids)
-        model_owns_merge = "multimodal_embeddings" in model_embed_sig.parameters
+        # Check whether the model has overridden embed_input_ids beyond the
+        # default provided by SupportsMultiModal.  The default implementation
+        # accepts multimodal_embeddings too (vllm interfaces.py), so checking
+        # for the parameter name would match every multimodal model (e.g.
+        # Ministral, Pixtral) and incorrectly skip the _shape_bucketer padding
+        # and the _has_oov_mm_tokens guard for them.  An identity check against
+        # the base-class method is exact and has zero runtime overhead.
+        model_owns_merge = (
+            type(self._model).embed_input_ids
+            is not SupportsMultiModal.embed_input_ids
+        )
 
         if model_owns_merge:
             # Delegate fully to the model's own embed_input_ids.
