@@ -42,7 +42,11 @@ def patch_siglip_vision_embeddings(model: torch.nn.Module, device: torch.device)
         patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
         if interpolate_pos_encoding:
-            embeddings += self.interpolate_pos_encoding(embeddings, height, width)
+            # interpolate_pos_encoding reads position_embedding.weight and
+            # position_ids, both pinned to CPU.  Round-trip embeddings through
+            # CPU so the add doesn't produce a device mismatch.
+            pos_emb = self.interpolate_pos_encoding(embeddings.to("cpu"), height, width)
+            embeddings = (embeddings.to("cpu") + pos_emb).to(device)
         else:
             # Both the embedding lookup and the add run on CPU to avoid
             # torch-spyre's compile_once re-entrancy (aten.embedding and
