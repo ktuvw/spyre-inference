@@ -320,6 +320,43 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
+        # Cache whether this model overrides embed_input_ids beyond the
+        # SupportsMultiModal default; evaluated once so the hot path per
+        # decode step pays no inspection cost.
+        object.__setattr__(
+            self,
+            "_model_owns_merge",
+            type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids,
+        )
+
+        # For models that own the merge (e.g. Granite Vision) the token
+        # embedding table must run on CPU because the model's boolean-mask
+        # index-put ops are unsupported on Spyre.  Keep a persistent CPU
+        # copy of the weight so we never migrate the live module in-place on
+        # every decode step.
+        embed_tokens_mod = getattr(
+            getattr(getattr(model, "language_model", None), "model", None),
+            "embed_tokens",
+            None,
+        )
+        if embed_tokens_mod is not None and type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids:
+            # Keep a persistent CPU copy of the weight.  embed_input_ids for
+            # this model runs entirely on CPU (boolean-mask scatter), while the
+            # main forward (__call__) needs the weight on Spyre.  We swap the
+            # .weight pointer rather than calling .to() in-place per step.
+            # Both copies must be nn.Parameter so that nn.Module.__setattr__
+            # accepts the assignment (it rejects a plain Tensor for a parameter
+            # slot with TypeError).
+            spyre_weight = embed_tokens_mod.weight  # original, lives on Spyre
+            cpu_weight = nn.Parameter(spyre_weight.detach().to("cpu"), requires_grad=False)
+            object.__setattr__(self, "_embed_tokens_mod", embed_tokens_mod)
+            object.__setattr__(self, "_embed_tokens_spyre_weight", spyre_weight)
+            object.__setattr__(self, "_embed_tokens_cpu_weight", cpu_weight)
+        else:
+            object.__setattr__(self, "_embed_tokens_mod", None)
+            object.__setattr__(self, "_embed_tokens_spyre_weight", None)
+            object.__setattr__(self, "_embed_tokens_cpu_weight", None)
+
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
@@ -404,25 +441,14 @@ class _SpyreModelWrapper:
         """
         has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
 
-        # Check whether the model has overridden embed_input_ids beyond the
-        # default provided by SupportsMultiModal.  The default implementation
-        # accepts multimodal_embeddings too (vllm interfaces.py), so checking
-        # for the parameter name would match every multimodal model (e.g.
-        # Ministral, Pixtral) and incorrectly skip the _shape_bucketer padding
-        # and the _has_oov_mm_tokens guard for them.  An identity check against
-        # the base-class method is exact and has zero runtime overhead.
-        model_owns_merge = (
-            type(self._model).embed_input_ids
-            is not SupportsMultiModal.embed_input_ids
-        )
-
-        if model_owns_merge:
+        if self._model_owns_merge:
             # Delegate fully to the model's own embed_input_ids.
             # The model body uses boolean-mask index-put ops
             # (e.g. text_embeds[is_multimodal] = 0.0, target[is_multimodal] = ...)
             # that Spyre does not support.  Only the token embedding lookup
-            # (language_model.model.embed_tokens) needs weights on CPU; moving
-            # the whole model would be prohibitively expensive.
+            # (language_model.model.embed_tokens) needs weights on CPU.
+            # We use a persistent CPU copy of the embedding weight (cached at
+            # init) so we never migrate the live module in-place per step.
             input_ids_cpu = convert(input_ids, dtype=torch.int64, device="cpu")
             mm_embeds_cpu = (
                 tree_map(
@@ -437,14 +463,12 @@ class _SpyreModelWrapper:
                 if isinstance(is_multimodal, torch.Tensor)
                 else is_multimodal
             )
-            # Move only the token embedding table to CPU; restore after.
-            embed_tokens = getattr(
-                getattr(getattr(self._model, "language_model", None), "model", None),
-                "embed_tokens",
-                None,
-            )
+            # Swap in the persistent CPU weight for the duration of the call,
+            # then restore the Spyre weight.  Two pointer assignments per step;
+            # no H2D/D2H transfer.
+            embed_tokens = self._embed_tokens_mod
             if embed_tokens is not None:
-                embed_tokens.to("cpu")
+                embed_tokens.weight = self._embed_tokens_cpu_weight
             try:
                 result = self._model.embed_input_ids(
                     input_ids_cpu,
@@ -454,7 +478,7 @@ class _SpyreModelWrapper:
                 )
             finally:
                 if embed_tokens is not None:
-                    embed_tokens.to(self._spyre_device)
+                    embed_tokens.weight = self._embed_tokens_spyre_weight
                 # _ds_buffers auto-migrate to inputs_embeds.device inside
                 # embed_input_ids (granite4_vision.py line ~854).  Since we
                 # ran on CPU they are now on CPU; move them back to Spyre so
