@@ -764,17 +764,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # Patches instances/classes, so it runs after load and before compile wraps modules
-        # in OptimizedModule and breaks traversal.
-        apply_multimodal_patches(self.model, self._spyre_device)
-
-        # Move plain tensor buffers (e.g. Granite4Vision _ds_buffers) to Spyre device.
-        if hasattr(self.model, "_ds_buffers"):
-            self.model._ds_buffers = [
-                convert(b, dtype=self.dtype, device=self._spyre_device)
-                for b in self.model._ds_buffers
-            ]
-
         # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
@@ -786,9 +775,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
-        # Patches instances, so it runs after load and before compile wraps modules
+        # Patches instances/classes, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.
-        # apply_multimodal_patches(self.model, self._spyre_device)
+        apply_multimodal_patches(self.model, self._spyre_device)
+
+        # Move plain tensor buffers (e.g. Granite4Vision _ds_buffers) to Spyre device.
+        if hasattr(self.model, "_ds_buffers"):
+            self.model._ds_buffers = [
+                convert(b, dtype=self.dtype, device=self._spyre_device)
+                for b in self.model._ds_buffers
+            ]
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
