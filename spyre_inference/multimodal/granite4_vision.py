@@ -49,8 +49,10 @@ def patch_interpolate_downsampler() -> None:
         batch_size, _, dim = image_features_cpu.size()
         up_shape = [batch_size, self.orig_image_side, self.orig_image_side, dim]
         large = image_features_cpu.view(up_shape).permute(0, 3, 1, 2)
-        small = torch.nn.functional.adaptive_avg_pool2d(
-            large, (self.new_image_side, self.new_image_side)
+        small = torch.nn.functional.interpolate(
+            large,
+            size=(self.new_image_side, self.new_image_side),
+            mode=self.mode,
         )
         out_cpu = small.permute(0, 2, 3, 1).flatten(1, 2)
         return convert(out_cpu, device=dev)
