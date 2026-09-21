@@ -415,7 +415,10 @@ class _SpyreModelWrapper:
             "embed_tokens",
             None,
         )
-        if embed_tokens_mod is not None and type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids:
+        if (
+            embed_tokens_mod is not None
+            and type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids
+        ):
             # Keep a persistent CPU copy of the weight.  embed_input_ids for
             # this model runs entirely on CPU (boolean-mask scatter), while the
             # main forward (__call__) needs the weight on Spyre.  We swap the
