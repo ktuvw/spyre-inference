@@ -548,10 +548,14 @@ class _SpyreModelWrapper:
             # We use a persistent CPU copy of the embedding weight (cached at
             # init) so we never migrate the live module in-place per step.
             input_ids_cpu = convert(input_ids, dtype=torch.int64, device="cpu")
-            mm_embeds_cpu = tree_map(
-                lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
-                multimodal_embeddings,
-            ) if has_mm else multimodal_embeddings
+            mm_embeds_cpu = (
+                tree_map(
+                    lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+                    multimodal_embeddings,
+                )
+                if has_mm
+                else multimodal_embeddings
+            )
 
             is_multimodal_cpu = (
                 is_multimodal.to("cpu")
