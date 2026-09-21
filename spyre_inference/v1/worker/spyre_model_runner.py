@@ -378,43 +378,6 @@ class _SpyreModelWrapper:
             "embed_tokens",
             None,
         )
-        if embed_tokens_mod is not None and type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids:
-            # Keep a persistent CPU copy of the weight.  embed_input_ids for
-            # this model runs entirely on CPU (boolean-mask scatter), while the
-            # main forward (__call__) needs the weight on Spyre.  We swap the
-            # .weight pointer rather than calling .to() in-place per step.
-            # Both copies must be nn.Parameter so that nn.Module.__setattr__
-            # accepts the assignment (it rejects a plain Tensor for a parameter
-            # slot with TypeError).
-            spyre_weight = embed_tokens_mod.weight  # original, lives on Spyre
-            cpu_weight = nn.Parameter(spyre_weight.detach().to("cpu"), requires_grad=False)
-            object.__setattr__(self, "_embed_tokens_mod", embed_tokens_mod)
-            object.__setattr__(self, "_embed_tokens_spyre_weight", spyre_weight)
-            object.__setattr__(self, "_embed_tokens_cpu_weight", cpu_weight)
-        else:
-            object.__setattr__(self, "_embed_tokens_mod", None)
-            object.__setattr__(self, "_embed_tokens_spyre_weight", None)
-            object.__setattr__(self, "_embed_tokens_cpu_weight", None)
-
-        # Cache whether this model overrides embed_input_ids beyond the
-        # SupportsMultiModal default; evaluated once so the hot path per
-        # decode step pays no inspection cost.
-        object.__setattr__(
-            self,
-            "_model_owns_merge",
-            type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids,
-        )
-
-        # For models that own the merge (e.g. Granite Vision) the token
-        # embedding table must run on CPU because the model's boolean-mask
-        # index-put ops are unsupported on Spyre.  Keep a persistent CPU
-        # copy of the weight so we never migrate the live module in-place on
-        # every decode step.
-        embed_tokens_mod = getattr(
-            getattr(getattr(model, "language_model", None), "model", None),
-            "embed_tokens",
-            None,
-        )
         if (
             embed_tokens_mod is not None
             and type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids
