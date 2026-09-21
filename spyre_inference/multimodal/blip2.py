@@ -43,7 +43,7 @@ def patch_blip2_qformer_attention() -> None:
     _orig_blip2_attn_forward = Blip2QFormerMultiHeadAttention.forward
 
     def _blip2_attn_forward_cpu(self, hidden_states, encoder_hidden_states=None):
-        target_device = hidden_states.device
+        target_device = next(self.parameters()).device
         hidden_states = convert(hidden_states, device="cpu")
         if encoder_hidden_states is not None:
             encoder_hidden_states = convert(encoder_hidden_states, device="cpu")
