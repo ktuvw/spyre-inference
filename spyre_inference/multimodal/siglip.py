@@ -60,10 +60,10 @@ def patch_siglip_vision_embeddings(model: torch.nn.Module, device: torch.device)
             module.position_embedding.to("cpu")
             module.register_buffer(
                 "position_ids",
-                module.position_ids.to("cpu"),
+                module.position_ids.to("cpu"),  # ty: ignore[invalid-argument-type]
                 persistent=False,
             )
-            module.forward = _siglip_embeddings_forward.__get__(module)  # ty: ignore[method-assign]
+            module.forward = _siglip_embeddings_forward.__get__(module)  # ty: ignore[invalid-assignment]
 
 
 def apply(model: torch.nn.Module, device: torch.device) -> None:
