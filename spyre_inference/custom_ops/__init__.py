@@ -25,6 +25,7 @@ from . import (
     gate_linear,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
     layer_norm,  # noqa: F401
+    rms_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
     mm_encoder_attention,  # noqa: F401
