@@ -36,6 +36,14 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 
 granite4_vision = pytest.importorskip("vllm.model_executor.models.granite4_vision")
 
+# Capture unpatched methods at import time, before any test can trigger the
+# process-wide class patches via patch_interpolate_downsampler() /
+# patch_pack_and_unpad_image_features().
+_STOCK_INTERPOLATE_CALL = granite4_vision.InterpolateDownsampler.__call__
+_STOCK_PACK_AND_UNPAD = (
+    granite4_vision.Granite4VisionForConditionalGeneration._pack_and_unpad_image_features
+)
+
 # InterpolateDownsampler config matching Granite Vision 4.1-4B defaults.
 # The SigLIP encoder outputs a 24×24 grid (336px / 14px patch = 24 patches/side)
 # which the downsampler reduces to 12×12 = 144 tokens.
@@ -212,13 +220,14 @@ def test_interpolate_downsampler_patched_matches_stock():
     as the unpatched version on CPU — the only change is an explicit CPU round-trip."""
     from spyre_inference.multimodal.granite4_vision import patch_interpolate_downsampler
 
-    ds_stock = _make_interpolate_downsampler()
     image_features = _make_image_features()
-    expected = ds_stock(image_features)
+
+    # Use the __call__ captured at import time — guards against earlier tests
+    # having already applied the process-wide class patch.
+    expected = _STOCK_INTERPOLATE_CALL(_make_interpolate_downsampler(), image_features)
 
     patch_interpolate_downsampler()
-    ds_patched = _make_interpolate_downsampler()
-    actual = ds_patched(image_features)
+    actual = _make_interpolate_downsampler()(image_features)
 
     assert actual.shape == expected.shape, (
         f"shape mismatch: got {actual.shape}, expected {expected.shape}"
@@ -258,8 +267,9 @@ def _make_pack_and_unpad_inputs(num_images: int = 1):
     The multi-patch branch additionally requires `self.config`,
     `self._downsample_rate`, etc., which a minimal stub cannot provide.
     """
+    rng = torch.Generator(device="cpu").manual_seed(1)
     image_features = [
-        torch.randn(1, NEW_IMAGE_SIDE**2, FEATURE_DIM, dtype=torch.float16)
+        torch.randn(1, NEW_IMAGE_SIDE**2, FEATURE_DIM, dtype=torch.float16, generator=rng)
         for _ in range(num_images)
     ]
     # image_sizes: (H, W) in original pixels — only read in the multi-patch branch.
@@ -274,13 +284,13 @@ def test_pack_and_unpad_patched_matches_stock():
     from spyre_inference.multimodal.granite4_vision import patch_pack_and_unpad_image_features
 
     image_features, image_sizes = _make_pack_and_unpad_inputs(num_images=1)
-    obj = _MinimalGranite4VisionModel()
 
-    # Stock output (before patch).
-    expected = obj.pack_and_unpad(image_features, image_sizes)
+    # Use the method captured at import time — guards against earlier tests
+    # having already applied the process-wide class patch.
+    expected = _STOCK_PACK_AND_UNPAD(_MinimalGranite4VisionModel(), image_features, image_sizes)
 
     patch_pack_and_unpad_image_features()
-    actual = obj.pack_and_unpad(image_features, image_sizes)
+    actual = _MinimalGranite4VisionModel().pack_and_unpad(image_features, image_sizes)
 
     assert len(actual) == len(expected), "result list length must match"
     for i, (a, e) in enumerate(zip(actual, expected)):
