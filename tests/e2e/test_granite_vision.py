@@ -46,9 +46,10 @@ MAX_TOKENS = 16
 def _synthetic_image_data_uri(size: int = 336, seed: int = 0) -> str:
     """A deterministic RGB image built in-process — no network, no binary asset.
 
-    336×336 matches Granite Vision 4.1's native SigLIP input size (patch=14,
-    giving a 24×24 token grid → 144 tokens after the ½-rate downsampler).
-    Using the native size avoids multi-tile expansion and keeps the test fast.
+    The default 336×336 matches Granite Vision 4.1's native SigLIP input size
+    (patch=14, giving a 24×24 token grid → 144 tokens after the ½-rate
+    downsampler) and produces exactly one tile.  Pass size=672 to force
+    multi-tile expansion (2–4 tiles) and exercise the multi-patch branch.
     """
     import base64
 
@@ -101,6 +102,7 @@ def _generate(conversations, enforce_eager: bool, images_per_prompt: int = 1):
 
 
 @pytest.mark.granite_vision_e2e
+@pytest.mark.multimodal
 @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
@@ -126,14 +128,19 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
 
 @pytest.mark.granite_vision_e2e
+@pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-def test_two_image_prompt_produces_output():
-    """Two images exercise the multi-tile branch of _pack_and_unpad_image_features.
+def test_multi_tile_image_prompt_produces_output(monkeypatch):
+    """A 672px image forces multi-tile expansion and exercises the multi-patch
+    branch of _pack_and_unpad_image_features.
 
     The single-patch branch (image_feature.shape[0] == 1) needs only
     `self.image_newline`; the multi-patch branch additionally reads
-    `self.config` and `self._downsample_rate`.  This test is the only
-    place that path is exercised end-to-end on the card.
+    `self.config` and `self._downsample_rate` and is the only place the
+    5-D permute that the patch exists for is actually reached.  A 336px
+    image always produces exactly one tile and takes the single-patch branch.
+    Using 672px forces multi-tile expansion (2–4 tiles), so image_feature
+    shape[0] > 1 and the patched 5-D permute path is exercised end-to-end.
 
     Eager only: the patch runs on CPU either way, so a compiled twin
     would cost a full graph build for no additional patch coverage.
@@ -141,10 +148,14 @@ def test_two_image_prompt_produces_output():
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")
 
-    uris = (_synthetic_image_data_uri(seed=0), _synthetic_image_data_uri(seed=97))
-    (text,) = _generate([_conversation(*uris)], enforce_eager=True, images_per_prompt=2)
+    # Graph building for a vision+decoder model exceeds the default timeout.
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
-    assert text.strip(), "empty generation from the two-image Granite Vision path"
+    # 672px triggers multi-tile expansion; 336px would stay in the single-patch branch.
+    uri = _synthetic_image_data_uri(size=672, seed=0)
+    (text,) = _generate([_conversation(uri)], enforce_eager=True, images_per_prompt=1)
+
+    assert text.strip(), "empty generation from the multi-tile Granite Vision path"
 
 
 if __name__ == "__main__":

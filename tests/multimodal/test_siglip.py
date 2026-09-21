@@ -223,6 +223,48 @@ def test_patched_forward_output_matches_stock():
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.siglip
+def test_patched_forward_interpolate_pos_encoding_cpu_roundtrip():
+    """The patched forward with interpolate_pos_encoding=True routes embeddings
+    through CPU before calling interpolate_pos_encoding, whose
+    position_embedding.weight and position_ids are pinned to CPU.
+
+    Granite Vision 4.1 always uses the native 336px image size so this branch
+    is not exercised in production.  The test verifies the CPU round-trip is
+    present by monkeypatching interpolate_pos_encoding with a stub that asserts
+    its input is on CPU — no non-native size needed, so the vLLM reshape bug
+    (weight.shape[1] vs weight.shape[0]) is never hit.
+    """
+    import types
+
+    from spyre_inference.multimodal.siglip import patch_siglip_vision_embeddings
+
+    rng = torch.Generator(device="cpu").manual_seed(7)
+    pixel_values = torch.randn(
+        1, IN_CHANNELS, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float16, generator=rng
+    )
+
+    emb = _make_siglip_embeddings()
+    model = nn.Module()
+    model.embeddings = emb
+    patch_siglip_vision_embeddings(model, torch.device("cpu"))
+
+    seen_devices = []
+
+    def _stub_interpolate(self, embeddings, height, width):
+        seen_devices.append(embeddings.device.type)
+        return torch.zeros_like(embeddings)
+
+    emb.interpolate_pos_encoding = types.MethodType(_stub_interpolate, emb)
+
+    emb(pixel_values, interpolate_pos_encoding=True)
+
+    assert seen_devices == ["cpu"], (
+        f"interpolate_pos_encoding received embeddings on {seen_devices} — "
+        "expected CPU round-trip before the call"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 4. On-card equivalence (skipped without a Spyre device)
 # ---------------------------------------------------------------------------

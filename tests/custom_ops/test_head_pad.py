@@ -75,6 +75,7 @@ def _fake_model_config(monkeypatch, *, padded=True, classes=None, transformers_b
         hf_config._spyre_orig_head_dim = _ORIG
     return SimpleNamespace(
         hf_config=hf_config,
+        hf_text_config=hf_config,  # for non-multimodal models text_config == hf_config
         using_transformers_backend=lambda: transformers_backend,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
@@ -141,6 +142,7 @@ def test_shim_skips_the_shared_vllm_attention_layers(monkeypatch):
     )
     model_config = SimpleNamespace(
         hf_config=hf_config,
+        hf_text_config=hf_config,
         using_transformers_backend=lambda: False,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
@@ -408,6 +410,7 @@ def test_language_layers_are_padded_and_vision_layers_are_not(monkeypatch):
     )
     model_config = SimpleNamespace(
         hf_config=hf_config,
+        hf_text_config=hf_config,
         using_transformers_backend=lambda: False,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
