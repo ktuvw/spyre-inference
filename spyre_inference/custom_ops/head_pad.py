@@ -187,7 +187,7 @@ def install_padded_head_dim(model_config) -> None:
     Skipped on the Transformers backend: HF attention sizes itself from
     ``config.head_dim``, so the override already lands there.
     """
-    target_config = getattr(model_config.hf_config, "text_config", model_config.hf_config)
+    target_config = model_config.hf_text_config
     if not head_padding_active(target_config):
         return
     if model_config.using_transformers_backend():
@@ -275,10 +275,9 @@ def verify_padded_head_dim(model, hf_config) -> None:
     raising, so a model the override failed to reach loads truncated weights and
     produces plausible-looking garbage instead of an error.
     """
-    target_config = getattr(hf_config, "text_config", hf_config)
-    if not head_padding_active(target_config):
+    if not head_padding_active(hf_config):
         return
-    padded = target_config.head_dim
+    padded = hf_config.head_dim
     bad = sorted(
         {
             f"{name}(head_size={module.head_size})"
@@ -303,8 +302,7 @@ def install_head_pad_weight_loader(model_loader, hf_config) -> None:
     shapes against the now-128-wide params). Full unsharded tensors are padded
     per-head, so TP narrowing downstream still selects whole padded heads.
     """
-    target_config = getattr(hf_config, "text_config", hf_config)
-    if not head_padding_active(target_config):
+    if not head_padding_active(hf_config):
         return
     if not hasattr(model_loader, "get_all_weights"):
         logger.warning(
@@ -313,10 +311,10 @@ def install_head_pad_weight_loader(model_loader, hf_config) -> None:
         )
         return
 
-    orig = getattr(target_config, _ORIG_ATTR)
-    padded = target_config.head_dim
-    n_heads = target_config.num_attention_heads
-    n_kv_heads = getattr(target_config, "num_key_value_heads", None) or n_heads
+    orig = getattr(hf_config, _ORIG_ATTR)
+    padded = hf_config.head_dim
+    n_heads = hf_config.num_attention_heads
+    n_kv_heads = getattr(hf_config, "num_key_value_heads", None) or n_heads
 
     original_get_all_weights = model_loader.get_all_weights
 
@@ -341,11 +339,10 @@ def fix_padded_attention_scale(model, hf_config) -> None:
     HF's ``module.scaling`` is reset too: ``vllm_attention_forward`` copies it onto
     ``impl.scale`` on every forward, so fixing only the vLLM layer would not stick.
     """
-    target_config = getattr(hf_config, "text_config", hf_config)
-    if not head_padding_active(target_config):
+    if not head_padding_active(hf_config):
         return
-    orig = getattr(target_config, _ORIG_ATTR)
-    padded_default = float(target_config.head_dim**-0.5)
+    orig = getattr(hf_config, _ORIG_ATTR)
+    padded_default = float(hf_config.head_dim**-0.5)
     orig_default = float(orig**-0.5)
 
     def is_padded_default(scale) -> bool:
@@ -375,12 +372,11 @@ def fix_padded_rope(model, hf_config) -> None:
     from it and zero-pads the trailing dims (harmless — the matching x pair dims
     are zero from weight padding).
     """
-    target_config = getattr(hf_config, "text_config", hf_config)
-    if not head_padding_active(target_config):
+    if not head_padding_active(hf_config):
         return
-    orig = getattr(target_config, _ORIG_ATTR)
-    max_position = target_config.max_position_embeddings
-    rope_parameters = getattr(target_config, "rope_parameters", None)
+    orig = getattr(hf_config, _ORIG_ATTR)
+    max_position = hf_config.max_position_embeddings
+    rope_parameters = getattr(hf_config, "rope_parameters", None)
 
     seen: set[int] = set()
     n = 0
