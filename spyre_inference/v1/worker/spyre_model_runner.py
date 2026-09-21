@@ -500,7 +500,9 @@ class _SpyreModelWrapper:
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
             return self._model.embed_multimodal(**kwargs)
 
-    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None, **kwargs):
+    def embed_input_ids(
+        self, input_ids, multimodal_embeddings=None, *, is_multimodal=None, **kwargs
+    ):
         """Move input_ids/is_multimodal/multimodal_embeddings onto Spyre.
 
         gpu_model_runner._preprocess calls this directly on `self.model`,
