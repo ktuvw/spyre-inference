@@ -37,6 +37,10 @@ HIDDEN_SIZE = 64
 NUM_HEADS = 4
 HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
 
+# Capture the unpatched forward at import time, before any test can trigger
+# the process-wide class patch via patch_blip2_qformer_attention().
+_STOCK_FORWARD = blip2.Blip2QFormerMultiHeadAttention.forward
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -132,8 +136,10 @@ def test_patched_forward_output_matches_stock(tp_group):
     seq_len = 8
     hidden_states = torch.randn(1, seq_len, HIDDEN_SIZE, dtype=torch.float16)
 
+    # Use the forward captured at import time — guards against earlier tests
+    # having already applied the process-wide class patch.
     attn_stock = _make_qformer_attention(tp_group)
-    expected = blip2.Blip2QFormerMultiHeadAttention.forward(attn_stock, hidden_states)
+    expected = _STOCK_FORWARD(attn_stock, hidden_states)
 
     patch_blip2_qformer_attention()
     attn_patched = _make_qformer_attention(tp_group)
@@ -151,8 +157,6 @@ def test_patched_forward_with_cross_attention_matches_stock(tp_group):
 
     from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
 
-    patch_blip2_qformer_attention()
-
     # encoder_hidden_size must match hidden_size so the cross-attention key/value
     # projections (in_features=encoder_hidden_size) accept our test tensors.
     config = Blip2QFormerConfig(
@@ -161,31 +165,108 @@ def test_patched_forward_with_cross_attention_matches_stock(tp_group):
         num_attention_heads=NUM_HEADS,
         attention_probs_dropout_prob=0.0,
     )
-    attn = blip2.Blip2QFormerMultiHeadAttention(
-        config, quant_config=None, cache_config=None, is_cross_attention=True
-    ).to(torch.float16)
-    rng = torch.Generator(device="cpu").manual_seed(2)
-    for p in attn.parameters():
-        p.data.copy_(torch.empty_like(p.data, device="cpu").normal_(std=0.02, generator=rng))
-    _finish_weight_loading(attn)
+
+    def _make_cross_attn():
+        attn = blip2.Blip2QFormerMultiHeadAttention(
+            config, quant_config=None, cache_config=None, is_cross_attention=True
+        ).to(torch.float16)
+        rng = torch.Generator(device="cpu").manual_seed(2)
+        for p in attn.parameters():
+            p.data.copy_(torch.empty_like(p.data, device="cpu").normal_(std=0.02, generator=rng))
+        _finish_weight_loading(attn)
+        return attn
 
     hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
     encoder_hidden_states = torch.randn(1, 16, HIDDEN_SIZE, dtype=torch.float16)
 
-    # Stock output on CPU (patch already applied, so compare with CPU input directly).
-    expected = blip2.Blip2QFormerMultiHeadAttention.forward(
-        attn, hidden_states, encoder_hidden_states
-    )
+    # Use the forward captured at import time — guards against earlier tests
+    # having already applied the process-wide class patch.
+    expected = _STOCK_FORWARD(_make_cross_attn(), hidden_states, encoder_hidden_states)
+
+    patch_blip2_qformer_attention()
     actual = blip2.Blip2QFormerMultiHeadAttention.forward(
-        attn, hidden_states, encoder_hidden_states
+        _make_cross_attn(), hidden_states, encoder_hidden_states
     )
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.blip2
+def test_patched_forward_restores_module_device_when_inputs_on_cpu(tp_group):
+    """target_device is read from module parameters, not the input tensor.
+
+    Staleness guard: asserts that next(self.parameters()).device is used to
+    determine the restore target.  Uses a monkeypatched sentinel so the test
+    is meaningful on CPU: if the implementation reverts to hidden_states.device
+    the sentinel would never be consulted and the assertion fires.
+    """
+    import types
+
+    from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
+
+    patch_blip2_qformer_attention()
+
+    attn = _make_qformer_attention(tp_group)  # on CPU
+
+    # Replace next(self.parameters()) with a sentinel that records whether it
+    # was called.  The patched forward calls next(self.parameters()).device, so
+    # if it regresses to hidden_states.device the sentinel is never hit.
+    parameters_called = []
+    real_parameters = attn.parameters
+
+    def _spy_parameters(self):
+        parameters_called.append(True)
+        return real_parameters()
+
+    attn.parameters = types.MethodType(_spy_parameters, attn)
+
+    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
+    blip2.Blip2QFormerMultiHeadAttention.forward(attn, hidden_states)
+
+    assert parameters_called, (
+        "patched forward never called self.parameters() — "
+        "target_device is not being derived from module parameters"
+    )
+    for name, param in attn.named_parameters():
+        assert param.device.type == "cpu", (
+            f"parameter {name!r} is on {param.device} after patched forward — "
+            "module was not restored to its original device"
+        )
+
+
 # ---------------------------------------------------------------------------
 # 4. On-card: module restored to device after call (skipped without Spyre)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.blip2
+def test_patched_forward_restores_module_to_spyre_with_cpu_inputs(tp_group):
+    """Module on Spyre, inputs on CPU: the module must be restored to Spyre.
+
+    This is the exact regression scenario Kevin's fix addresses.  The old code
+    read target_device from hidden_states.device (CPU), so the finally block
+    called self.to("cpu") and permanently stranded the module.  The fix reads
+    next(self.parameters()).device (Spyre) instead.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
+
+    patch_blip2_qformer_attention()
+
+    device = torch.device("spyre")
+    attn = _make_qformer_attention(tp_group).to(device)
+
+    # Inputs deliberately on CPU — this is what triggers the bug in old code.
+    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
+    blip2.Blip2QFormerMultiHeadAttention.forward(attn, hidden_states)
+
+    for name, param in attn.named_parameters():
+        assert param.device.type == "spyre", (
+            f"parameter {name!r} is on {param.device} after patched forward with "
+            "CPU inputs — module was stranded off Spyre (target_device regression)"
+        )
 
 
 @pytest.mark.blip2
@@ -227,8 +308,10 @@ def test_patched_forward_output_matches_cpu_on_spyre(tp_group):
     rng = torch.Generator(device="cpu").manual_seed(5)
     hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16, generator=rng)
 
+    # Use the forward captured at import time — guards against earlier tests
+    # having already applied the process-wide class patch.
     attn_cpu = _make_qformer_attention(tp_group)
-    expected = blip2.Blip2QFormerMultiHeadAttention.forward(attn_cpu, hidden_states)
+    expected = _STOCK_FORWARD(attn_cpu, hidden_states)
 
     device = torch.device("spyre")
     attn_dev = _make_qformer_attention(tp_group).to(device)
