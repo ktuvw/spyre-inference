@@ -12,7 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BLIP-2 / Q-Former workarounds for Spyre."""
+"""BLIP-2 / Q-Former workarounds for Spyre.
+
+TODO: remove this file when spyre-inference moves to vLLM 0.30.0.
+
+Upstream switched Blip2QFormerMultiHeadAttention to use MMEncoderAttention in
+vllm-project/vllm@a1541f5, the same path SigLIP takes
+(vllm/model_executor/models/siglip.py:698).  SpyreMMEncoderAttention already
+covers that path, so once we upgrade the Q-Former attention runs on-card
+natively and this entire workaround becomes dead code.
+"""
 
 from __future__ import annotations
 
