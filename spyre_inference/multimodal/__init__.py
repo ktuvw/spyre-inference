@@ -50,16 +50,18 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
         tower_cls = type(vision_tower).__name__
         if tower_cls == "Gemma4VisionModel":
             gemma4_vision.apply(model, device)
-        elif tower_cls == "VisionTransformer":
-            # Pixtral (mistral-format) and Mistral3 (HF-format) both use
-            # vLLM's VisionTransformer as their tower.
+        elif tower_cls == "SiglipVisionModel":
+            # Granite4Vision uses a SigLIP tower. All three patches are
+            # needed together and none apply to any other architecture.
+            siglip.apply(model, device)
+            granite4_vision.apply(model, device)
+            blip2.apply(model, device)
+        else:
+            # Pixtral (mistral-format, VisionTransformer) and Mistral3 HF-format
+            # (PixtralHFVisionModel) both need the Pixtral patches. Any tower that
+            # is not Gemma4 or SigLIP goes here; the patch functions are
+            # individually guarded and no-op when the expected symbols are absent.
             pixtral.apply(model, device)
-
-        # SigLIP and Granite Vision patches are instance-level and must always
-        # run after the tower check; they self-guard via isinstance / hasattr.
-        siglip.apply(model, device)
-        granite4_vision.apply(model, device)
-        blip2.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
     # Gated on model_type, not just attribute presence: other architectures (e.g.
