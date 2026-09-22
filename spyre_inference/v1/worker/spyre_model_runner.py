@@ -323,6 +323,32 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     return block_lists
 
 
+def _model_owns_embed_merge(model: nn.Module) -> bool:
+    """True when ``model.embed_input_ids`` does the multimodal merge itself.
+
+    Two paths:
+    - Explicit opt-in: the model class (or a base) sets
+      ``_spyre_embed_owns_merge = True``.  Set this on any Spyre subclass
+      whose embed_input_ids does boolean-mask scatter that Spyre cannot run.
+    - Known upstream class: ``Granite4VisionForConditionalGeneration`` owns
+      the merge but lives in vLLM and cannot carry the marker.
+
+    ``type(model)`` is avoided deliberately: after ``torch.compile`` the
+    runtime type is a dynamo-generated wrapper (e.g. ``_Vision``) that does
+    not have ``embed_input_ids`` in its ``__dict__``, raising ``AttributeError``
+    on the ``is not`` identity check.  We unwrap to the original model class
+    before inspecting.
+    """
+    # Unwrap torch.compile's OptimizedModule so we inspect the real class.
+    unwrapped = getattr(model, "_orig_mod", model)
+    cls = type(unwrapped)
+    # Explicit opt-in marker checked first.
+    if getattr(cls, "_spyre_embed_owns_merge", False):
+        return True
+    # Fallback for upstream classes we cannot annotate.
+    return cls.__name__ == "Granite4VisionForConditionalGeneration"
+
+
 class _SpyreModelWrapper:
     """Transparent wrapper that converts model inputs/outputs at the boundary.
 
@@ -359,14 +385,11 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
-        # Cache whether this model overrides embed_input_ids beyond the
-        # SupportsMultiModal default; evaluated once so the hot path per
-        # decode step pays no inspection cost.
-        object.__setattr__(
-            self,
-            "_model_owns_merge",
-            type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids,
-        )
+        # Cache whether this model's embed_input_ids owns the multimodal merge
+        # (i.e. does boolean-mask scatter that Spyre cannot run natively).
+        # See _model_owns_embed_merge for the detection logic.
+        owns_merge = _model_owns_embed_merge(model)
+        object.__setattr__(self, "_model_owns_merge", owns_merge)
 
         # For models that own the merge (e.g. Granite Vision) the token
         # embedding table must run on CPU because the model's boolean-mask
@@ -378,10 +401,7 @@ class _SpyreModelWrapper:
             "embed_tokens",
             None,
         )
-        if (
-            embed_tokens_mod is not None
-            and type(model).embed_input_ids is not SupportsMultiModal.embed_input_ids
-        ):
+        if embed_tokens_mod is not None and owns_merge:
             # Keep a persistent CPU copy of the weight.  embed_input_ids for
             # this model runs entirely on CPU (boolean-mask scatter), while the
             # main forward (__call__) needs the weight on Spyre.  We swap the
