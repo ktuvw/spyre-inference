@@ -128,10 +128,26 @@ def _pad_fused_qkv(
     )
 
 
+def _is_target_attn_weight(name: str) -> bool:
+    """Exclude non-language-model weights (vision tower, projectors, qformers)."""
+    return not any(
+        k in name
+        for k in (
+            "vision_tower",
+            "vision_model",
+            "layerwise_projectors",
+            "spatial_projectors",
+            "qformer",
+        )
+    )
+
+
 def _pad_weight(
     name: str, w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right padding by its name."""
+    if not _is_target_attn_weight(name):
+        return w
     # Must precede the v_proj test: "qkv_proj.weight" also ends with "v_proj.weight".
     if name.endswith(("qkv_proj.weight", "qkv_proj.bias")):
         return _pad_fused_qkv(w, n_heads, n_kv_heads, orig, padded)
@@ -171,18 +187,35 @@ def install_padded_head_dim(model_config) -> None:
     Skipped on the Transformers backend: HF attention sizes itself from
     ``config.head_dim``, so the override already lands there.
     """
-    if not head_padding_active(model_config.hf_config):
+    target_config = model_config.hf_text_config
+    if not head_padding_active(target_config):
         return
     if model_config.using_transformers_backend():
         return
-    orig = getattr(model_config.hf_config, _ORIG_ATTR)
-    padded = model_config.hf_config.head_dim
+    orig = getattr(target_config, _ORIG_ATTR)
+    padded = target_config.head_dim
 
+    modules = set()
     architectures = getattr(model_config.hf_config, "architectures", None) or []
-    model_cls, _ = model_config.registry.resolve_model_cls(architectures, model_config=model_config)
-    module = sys.modules.get(model_cls.__module__)
-    if module is None:
-        logger.warning("Cannot locate module for %s; head_dim not shimmed.", model_cls)
+    if architectures:
+        model_cls, _ = model_config.registry.resolve_model_cls(
+            architectures, model_config=model_config
+        )
+        if model_cls and sys.modules.get(model_cls.__module__):
+            modules.add(sys.modules[model_cls.__module__])
+
+    # For multimodal composite architectures, also check the text backbone module
+    text_archs = getattr(target_config, "architectures", None) or []
+    for arch in text_archs:
+        try:
+            text_cls, _ = model_config.registry.resolve_model_cls([arch], model_config=model_config)
+            if text_cls and sys.modules.get(text_cls.__module__):
+                modules.add(sys.modules[text_cls.__module__])
+        except Exception:
+            pass
+
+    if not modules:
+        logger.warning("Cannot locate modules for %s; head_dim not shimmed.", architectures)
         return
 
     def _make_head_dim_property(orig: int, padded: int) -> property:
@@ -203,26 +236,27 @@ def install_padded_head_dim(model_config) -> None:
         return prop
 
     patched = []
-    for name, obj in vars(module).items():
-        # Model-level attention classes only. The shared vLLM attention *layers* are
-        # imported into the same namespace but are handed an already-padded
-        # head_size, and patching them would mutate a class the whole process uses.
-        if (
-            not isinstance(obj, type)
-            or not name.endswith("Attention")
-            or obj.__module__.startswith("vllm.model_executor.layers")
-        ):
-            continue
-        existing = vars(obj).get("head_dim")
-        # Replace a shim left by an earlier model in this process (its widths may
-        # differ); leave anything the model itself defines alone.
-        if (
-            existing is not None
-            and getattr(getattr(existing, "fget", None), "_spyre_shim", None) is None
-        ):
-            continue
-        obj.head_dim = _make_head_dim_property(orig, padded)
-        patched.append(name)
+    for mod in modules:
+        for name, obj in vars(mod).items():
+            # Model-level attention classes only. The shared vLLM attention *layers* are
+            # imported into the same namespace but are handed an already-padded
+            # head_size, and patching them would mutate a class the whole process uses.
+            if (
+                not isinstance(obj, type)
+                or not name.endswith("Attention")
+                or obj.__module__.startswith("vllm.model_executor.layers")
+            ):
+                continue
+            existing = vars(obj).get("head_dim")
+            # Replace a shim left by an earlier model in this process (its widths may
+            # differ); leave anything the model itself defines alone.
+            if (
+                existing is not None
+                and getattr(getattr(existing, "fget", None), "_spyre_shim", None) is None
+            ):
+                continue
+            obj.head_dim = _make_head_dim_property(orig, padded)
+            patched.append(name)
     logger.info("Shimmed head_dim %d -> %d on: %s", orig, padded, ", ".join(patched))
 
 

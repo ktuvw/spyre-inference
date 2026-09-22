@@ -36,6 +36,7 @@ public_models:
     revision: 55611d7bca2a7133960a6d3b71e083071bbfc312
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b
+  - ibm-granite/granite-vision-4.1-4b
   - repo: ibm-granite/granite-3.3-8b-instruct
     revision: 51dd4bc2ade4059a6bd87649d68aa11e4fb2529b
   - repo: ibm-granite/granite-4.1-8b
