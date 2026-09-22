@@ -54,7 +54,6 @@ from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.model_loader import get_model_loader
-from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
