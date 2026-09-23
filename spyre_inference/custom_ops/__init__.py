@@ -30,7 +30,6 @@ from . import (
     mm_encoder_attention,  # noqa: F401
     multimodal_embeddings,
     parallel_lm_head,
-    rms_norm,  # noqa: F401
     rotary_embedding,
     utils,
     vit_attn,
