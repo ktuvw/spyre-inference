@@ -355,5 +355,258 @@ def test_pack_and_unpad_result_on_correct_device_on_spyre():
         )
 
 
+# ---------------------------------------------------------------------------
+# 3c. patch_embed_input_ids — replaces spyre_model_runner index_put logic
+# ---------------------------------------------------------------------------
+# Upstream embed_input_ids uses two boolean-mask index_puts that Spyre cannot
+# execute:
+#   1. text_embeds[is_multimodal] = 0.0
+#   2. target[is_multimodal] = level_features[level_idx]
+#
+# The patch replaces (1) with torch.where and (2) with a CPU scatter + copy_,
+# keeping the embedding lookup on-card.
+#
+# The fake model only needs:
+#   - self.language_model.model.embed_input_ids(input_ids) → text embeddings
+#   - self.language_model.model.config.embedding_multiplier
+#   - self._ds_buffers   list of [max_tokens, lm_hidden] tensors (one per level)
+#   - self._ds_layer_indices  list of level indices (len = num_levels)
+#   - self._ds_num_tokens     written by the patch
+
+_LM_HIDDEN = 32  # small but realistic; must be divisible by the split
+_MAX_TOKENS = 16
+_NUM_LEVELS = 2
+_EMBEDDING_MULTIPLIER = 0.5
+
+
+class _MinimalLMInner:
+    """Stub for self.language_model.model."""
+
+    class _Config:
+        embedding_multiplier = _EMBEDDING_MULTIPLIER
+
+    config = _Config()
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Deterministic: token index → float embedding of width _LM_HIDDEN.
+        rng = torch.Generator(device="cpu").manual_seed(int(input_ids.sum().item()))
+        return torch.randn(len(input_ids), _LM_HIDDEN, dtype=torch.float16, generator=rng)
+
+
+class _MinimalLanguageModel:
+    model = _MinimalLMInner()
+
+
+class _MinimalGranite4VisionEmbedModel:
+    """Minimal stub for Granite4VisionForConditionalGeneration.
+
+    Only the attributes embed_input_ids reads are provided.
+    """
+
+    def __init__(self, num_levels: int = _NUM_LEVELS):
+        self.language_model = _MinimalLanguageModel()
+        self._ds_buffers = [
+            torch.zeros(_MAX_TOKENS, _LM_HIDDEN, dtype=torch.float16) for _ in range(num_levels)
+        ]
+        self._ds_layer_indices = list(range(num_levels))
+        self._ds_num_tokens = -1  # sentinel; will be overwritten by the patch
+
+    def embed_input_ids(
+        self, input_ids, multimodal_embeddings=None, *, is_multimodal=None, handle_oov_mm_token=True
+    ):
+        cls = granite4_vision.Granite4VisionForConditionalGeneration
+        return cls.embed_input_ids(
+            self,
+            input_ids,
+            multimodal_embeddings,
+            is_multimodal=is_multimodal,
+            handle_oov_mm_token=handle_oov_mm_token,
+        )
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_target_symbol_exists():
+    """Granite4VisionForConditionalGeneration must have `embed_input_ids`."""
+    cls = getattr(granite4_vision, "Granite4VisionForConditionalGeneration", None)
+    assert cls is not None
+    assert hasattr(cls, "embed_input_ids"), (
+        "Granite4VisionForConditionalGeneration.embed_input_ids is gone — "
+        "patch_embed_input_ids in multimodal/granite4_vision.py is a silent no-op"
+    )
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_is_applied_and_idempotent():
+    """`patch_embed_input_ids` must mark `embed_input_ids` with `_spyre_patched`
+    and a second call must be a no-op."""
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+    cls = granite4_vision.Granite4VisionForConditionalGeneration
+    patched = cls.embed_input_ids
+    assert getattr(patched, "_spyre_patched", False) is True
+
+    patch_embed_input_ids()
+    assert cls.embed_input_ids is patched, "second call must be a no-op"
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_text_only_path():
+    """With no multimodal embeddings, the patch must:
+    - return text_embeds * embedding_multiplier
+    - set _ds_num_tokens = 0
+    """
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+    obj = _MinimalGranite4VisionEmbedModel()
+
+    N = 8
+    input_ids = torch.arange(N)
+
+    result = obj.embed_input_ids(input_ids, multimodal_embeddings=None, is_multimodal=None)
+
+    assert result.shape == (N, _LM_HIDDEN)
+    assert obj._ds_num_tokens == 0
+
+    # Values must equal text_embeds * embedding_multiplier.
+    expected_embeds = obj.language_model.model.embed_input_ids(input_ids)
+    torch.testing.assert_close(
+        result.float(),
+        (expected_embeds * _EMBEDDING_MULTIPLIER).float(),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_text_only_path_ds_num_tokens_zero():
+    """_ds_num_tokens must be 0 even when is_multimodal is all-False."""
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+    obj = _MinimalGranite4VisionEmbedModel()
+
+    N = 6
+    input_ids = torch.arange(N)
+    is_multimodal = torch.zeros(N, dtype=torch.bool)
+
+    obj.embed_input_ids(input_ids, multimodal_embeddings=[], is_multimodal=is_multimodal)
+
+    assert obj._ds_num_tokens == 0
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_vision_path_zeros_image_positions():
+    """Image-token positions in the output must be zero (not the raw text embedding).
+
+    The patch uses torch.where(mask, zeros, text_embeds); the text-token positions
+    must be text_embeds * embedding_multiplier and the image positions must be 0.
+    """
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+    obj = _MinimalGranite4VisionEmbedModel(num_levels=_NUM_LEVELS)
+
+    N = 8
+    num_img_tokens = 2
+    # positions 3 and 5 are image tokens
+    is_multimodal = torch.zeros(N, dtype=torch.bool)
+    is_multimodal[3] = True
+    is_multimodal[5] = True
+
+    # multimodal_embeddings: one tensor of shape [num_img_tokens, lm_hidden * num_levels]
+    rng = torch.Generator(device="cpu").manual_seed(10)
+    mm_emb = torch.randn(
+        num_img_tokens, _LM_HIDDEN * _NUM_LEVELS, dtype=torch.float16, generator=rng
+    )
+
+    input_ids = torch.arange(N)
+    result = obj.embed_input_ids(input_ids, [mm_emb], is_multimodal=is_multimodal)
+
+    assert result.shape == (N, _LM_HIDDEN)
+
+    # Image positions must be zero.
+    assert not result[is_multimodal].any(), (
+        "image-token positions in inputs_embeds must be zeroed by torch.where"
+    )
+
+    # Text positions must be non-zero (text_embeds * multiplier).
+    text_mask = ~is_multimodal
+    assert result[text_mask].any(), "text positions must carry the text embeddings"
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_vision_path_fills_ds_buffers():
+    """_ds_buffers must be filled with the scattered multimodal features.
+
+    For each level l, _ds_buffers[l][is_multimodal] must equal the l-th chunk
+    of the packed multimodal tensor (split along the last dim by lm_hidden).
+    """
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+    obj = _MinimalGranite4VisionEmbedModel(num_levels=_NUM_LEVELS)
+
+    N = 8
+    num_img_tokens = 3
+    is_multimodal = torch.zeros(N, dtype=torch.bool)
+    is_multimodal[1] = True
+    is_multimodal[4] = True
+    is_multimodal[6] = True
+
+    rng = torch.Generator(device="cpu").manual_seed(20)
+    mm_emb = torch.randn(
+        num_img_tokens, _LM_HIDDEN * _NUM_LEVELS, dtype=torch.float16, generator=rng
+    )
+
+    input_ids = torch.arange(N)
+    obj.embed_input_ids(input_ids, [mm_emb], is_multimodal=is_multimodal)
+
+    assert obj._ds_num_tokens == N
+
+    # Each level's buffer slice must equal the corresponding level features.
+    level_features = mm_emb.split(_LM_HIDDEN, dim=-1)
+    for lvl in range(_NUM_LEVELS):
+        buf_slice = obj._ds_buffers[lvl][:N]
+        # Only image-token rows are filled; text rows stay zero.
+        torch.testing.assert_close(
+            buf_slice[is_multimodal].float(),
+            level_features[lvl].float(),
+            atol=1e-4,
+            rtol=1e-4,
+            msg=f"level {lvl}: ds_buffer image rows do not match packed features",
+        )
+        assert not buf_slice[~is_multimodal].any(), (
+            f"level {lvl}: text-token rows in ds_buffer must be zero"
+        )
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_ds_buffers_migrated_to_correct_device():
+    """_ds_buffers must be migrated to match text_embeds device/dtype on first call.
+
+    On CPU the migration is a no-op (same device), but the dtype check fires when
+    _ds_buffers are float32 and text_embeds are float16.
+    """
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+    obj = _MinimalGranite4VisionEmbedModel()
+
+    # Deliberately initialise buffers in float32 to trigger the dtype migration.
+    obj._ds_buffers = [
+        torch.zeros(_MAX_TOKENS, _LM_HIDDEN, dtype=torch.float32) for _ in range(_NUM_LEVELS)
+    ]
+
+    input_ids = torch.arange(4)
+    obj.embed_input_ids(input_ids)  # text-only path still runs the migration
+
+    for i, buf in enumerate(obj._ds_buffers):
+        assert buf.dtype == torch.float16, (
+            f"_ds_buffers[{i}].dtype must be float16 after migration; got {buf.dtype}"
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

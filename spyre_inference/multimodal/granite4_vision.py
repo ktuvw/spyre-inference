@@ -191,11 +191,16 @@ def patch_embed_input_ids() -> None:
         level_features_cpu = all_packed_cpu.split(lm_h, dim=-1)  # num_levels tensors on CPU
 
         is_multimodal_cpu = convert(is_multimodal, device="cpu")
+        buf_len = self._ds_buffers[0].shape[0]
         for level_idx in range(len(self._ds_layer_indices)):
-            # Scatter on CPU into a staging slice, then copy to the device buffer.
-            staged = torch.zeros(N, lm_h, dtype=inputs_embeds.dtype)
-            staged[is_multimodal_cpu] = level_features_cpu[level_idx]
-            self._ds_buffers[level_idx][:N].copy_(staged)
+            # Stage the full buffer size on CPU (same shape as the on-device
+            # allocation).  Spyre's DMA validates against the physical allocation
+            # size, not the Python slice — copying a sub-slice [:N] raises
+            # "Invalid dma sizes".  Staging buf_len rows and copying the whole
+            # buffer avoids the mismatch; rows beyond N stay zero and are harmless.
+            staged = torch.zeros(buf_len, lm_h, dtype=inputs_embeds.dtype)
+            staged[:N][is_multimodal_cpu] = level_features_cpu[level_idx]
+            self._ds_buffers[level_idx].copy_(staged)
 
         self._ds_num_tokens = N
         return inputs_embeds

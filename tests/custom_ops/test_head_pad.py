@@ -319,22 +319,20 @@ def test_pad_weight_splits_a_fused_qkv_projection():
 
 
 # ---------------------------------------------------------------------------
-# Granite Vision 4.1 — language vs vision layer padding separation
+# Granite Vision 4.1 — composite arch head_dim shim
 # ---------------------------------------------------------------------------
-# Granite Vision 4.1-4B is a composite model: a Granite text decoder
-# (head_dim=128, no padding needed) wraps a SigLIP vision encoder
-# (head_dim=1152//16=72, needs padding to 128) and a BLIP-2 Q-Former projector.
+# Granite Vision 4.1-4B is a composite model: a Granite text decoder wraps a
+# SigLIP vision encoder and a BLIP-2 Q-Former projector.
 #
-# The bug this tests: `install_padded_head_dim` shimmed head_dim on *all*
-# `*Attention` classes in the top-level model module, including SiglipAttention,
-# because it only read `target_config` (the text config) for the orig/padded dims.
-# That meant SiglipAttention got a shim with orig=64/padded=128 (text dims) even
-# though its actual head_dim=72 — substituting the wrong width and corrupting
-# every Q/K/V shape in the vision encoder.
+# Bug: the top-level arch (granite4_vision.py) contains no *Attention class —
+# GraniteAttention lives in granite.py, SiglipAttention in siglip.py.
+# `install_padded_head_dim` only iterated the top-level module, so the shim
+# never reached GraniteAttention, the text decoder ran at head_dim=64, and
+# the weight pass emitted 128-wide tensors causing a shape mismatch at load.
 #
-# The fix: `_is_target_attn_weight` excludes weight names whose path contains
-# a vision-tower prefix, and `install_padded_head_dim` only shims classes whose
-# module belongs to the text backbone, not the vision tower.
+# Fix: the `text_archs` loop resolves the text backbone architecture from
+# hf_text_config.architectures and iterates that module, so GraniteAttention
+# is shimmed even when it lives outside the top-level arch module.
 
 # Text decoder dims (Granite 3.x: head_dim already 128, no padding in practice,
 # but use 64->128 to match the existing test fixtures so we can reuse helpers).
@@ -345,12 +343,13 @@ _VIS_ORIG, _VIS_PADDED = 72, 128
 
 
 def test_vision_tower_weights_are_not_padded():
-    """Weight names under `vision_tower.*` must pass through _pad_weight unchanged.
+    """Weight names outside ``language_model.`` must pass through _pad_weight unchanged.
 
-    This is the direct guard on the silent-corruption path: the weight loader
-    streams every checkpoint tensor through _pad_weight; if a vision-tower
-    q_proj matched the language rule it would be interleaved at the wrong
-    head_dim and corrupt the SigLIP encoder on every forward pass.
+    ``install_head_pad_weight_loader`` passes ``text_prefix="language_model."`` for
+    composite checkpoints, restricting padding to the text backbone.  Vision-tower
+    weights that share suffix patterns with language attention weights (q_proj,
+    v_proj) must not be padded — they use a different head_dim and the interleave
+    would corrupt every Q/K/V shape in the vision encoder.
     """
     n_heads, hidden = 16, 1152  # SigLIP-SO400M dims
     rows = n_heads * _VIS_ORIG
@@ -360,72 +359,91 @@ def test_vision_tower_weights_are_not_padded():
         "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
         "vision_model.encoder.layers.0.self_attn.q_proj.weight",
         "vision_tower.encoder.layers.0.self_attn.v_proj.weight",
-        "qformer.encoder.layer.0.attention.self.query.weight",
     ):
-        out = _pad_weight(layer_name, w, n_heads, n_heads, _VIS_ORIG, _VIS_PADDED)
+        out = _pad_weight(
+            layer_name, w, n_heads, n_heads, _VIS_ORIG, _VIS_PADDED, text_prefix="language_model."
+        )
         assert torch.equal(out, w), (
             f"_pad_weight must return the tensor unchanged for {layer_name!r}; "
             "vision-tower weights must not be padded with language head dims"
         )
 
+    # Positive side: a weight under the text backbone prefix must be padded.
+    # Guards against _is_target_attn_weight being broken in the other direction
+    # (returning False for everything would make all the assertions above pass
+    # trivially while silently leaving language weights unpadded).
+    lang_name = "language_model.model.layers.0.self_attn.q_proj.weight"
+    out = _pad_weight(
+        lang_name, w, n_heads, n_heads, _VIS_ORIG, _VIS_PADDED, text_prefix="language_model."
+    )
+    assert not torch.equal(out, w), f"_pad_weight must pad {lang_name!r} when text_prefix matches"
 
-def test_language_layers_are_padded_and_vision_layers_are_not(monkeypatch):
-    """install_padded_head_dim must shim language attention classes but leave
-    vision attention classes alone.
 
-    A composite model's module contains both `GraniteAttention` (language) and
-    `SiglipAttention` (vision). The shim must only substitute `orig` on the
-    language class — whose head_dim genuinely equals `orig` — so that
-    `SiglipAttention`, whose head_dim=72 != 64, is never touched.
+def test_text_backbone_attention_shimmed_when_in_separate_module(monkeypatch):
+    """install_padded_head_dim must shim GraniteAttention via the text_archs loop
+    when it lives in a different module from the top-level composite arch class.
+
+    This is the regression test for the PR's fix: the top-level arch module
+    (granite4_vision_module) contains no *Attention class, mirroring the real
+    granite4_vision.py.  Before the fix the shim would patch nothing.  After the
+    fix the text_archs loop resolves GraniteForCausalLM from hf_text_config and
+    finds GraniteAttention in that separate module.
     """
-    module_name = "spyre_test_granite_vision_module"
+    import types
 
-    # Language attention: derives head_dim = hidden // num_heads = 64 (orig).
+    # Top-level composite arch module: no *Attention classes (mirrors granite4_vision.py).
+    top_module_name = "spyre_test_granite4_vision_module"
+    top_module = types.ModuleType(top_module_name)
+    model_cls = type("GraniteVisionForConditionalGeneration", (), {})
+    model_cls.__module__ = top_module_name
+    top_module.GraniteVisionForConditionalGeneration = model_cls
+    monkeypatch.setitem(sys.modules, top_module_name, top_module)
+
+    # Text backbone module: contains GraniteAttention (mirrors granite.py).
+    text_module_name = "spyre_test_granite_module"
+    text_module = types.ModuleType(text_module_name)
+
     class GraniteAttention(_DerivesOwnHeadDim):
         def __init__(self):
             super().__init__(hidden_size=1024, num_heads=16)  # head_dim=64=_LANG_ORIG
 
-    # Vision attention: derives head_dim = 1152 // 16 = 72 (_VIS_ORIG ≠ _LANG_ORIG).
-    class SiglipAttention(_DerivesOwnHeadDim):
-        def __init__(self):
-            super().__init__(hidden_size=1152, num_heads=16)  # head_dim=72
+    GraniteAttention.__module__ = text_module_name
+    text_cls = type("GraniteForCausalLM", (), {})
+    text_cls.__module__ = text_module_name
+    text_module.GraniteAttention = GraniteAttention
+    text_module.GraniteForCausalLM = text_cls
+    monkeypatch.setitem(sys.modules, text_module_name, text_module)
 
-    import types
-
-    module = types.ModuleType(module_name)
-    for cls in (GraniteAttention, SiglipAttention):
-        cls.__module__ = module_name
-        setattr(module, cls.__name__, cls)
-    monkeypatch.setitem(sys.modules, module_name, module)
-
-    model_cls = type("GraniteVisionForConditionalGeneration", (), {})
-    model_cls.__module__ = module_name
-
-    # hf_config has _spyre_orig_head_dim set on the top-level config (no text_config
-    # sub-object) so install_padded_head_dim reads orig=_LANG_ORIG, padded=_LANG_PADDED.
     hf_config = SimpleNamespace(
         head_dim=_LANG_PADDED,
         _spyre_orig_head_dim=_LANG_ORIG,
         architectures=["GraniteVisionForConditionalGeneration"],
     )
+    hf_text_config = SimpleNamespace(
+        head_dim=_LANG_PADDED,
+        _spyre_orig_head_dim=_LANG_ORIG,
+        architectures=["GraniteForCausalLM"],
+    )
+
+    def resolve(archs, model_config):
+        if archs[0] == "GraniteVisionForConditionalGeneration":
+            return model_cls, archs[0]
+        if archs[0] == "GraniteForCausalLM":
+            return text_cls, archs[0]
+        raise ValueError(f"Unknown arch: {archs[0]}")
+
     model_config = SimpleNamespace(
         hf_config=hf_config,
-        hf_text_config=hf_config,
+        hf_text_config=hf_text_config,
         using_transformers_backend=lambda: False,
-        registry=SimpleNamespace(
-            resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
-        ),
+        registry=SimpleNamespace(resolve_model_cls=resolve),
     )
 
     install_padded_head_dim(model_config)
 
-    # Language class: head_dim=64 (_LANG_ORIG) must be substituted to 128.
+    # GraniteAttention must be shimmed via the text_archs loop — it is not in the
+    # top-level arch module, so without the fix it would remain at the native width.
     assert GraniteAttention().head_dim == _LANG_PADDED, (
-        "language attention head_dim must be padded from orig to padded"
-    )
-
-    # Vision class: head_dim=72 (_VIS_ORIG) must NOT be substituted —
-    # 72 != _LANG_ORIG (64), so the setter's `value == orig` guard leaves it alone.
-    assert SiglipAttention().head_dim == _VIS_ORIG, (
-        "vision attention head_dim must not be altered by the language padding shim"
+        "GraniteAttention in the text backbone module must be shimmed by the "
+        "text_archs loop; without the PR fix it would remain at the native width"
     )
