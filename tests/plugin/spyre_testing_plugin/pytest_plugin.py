@@ -32,6 +32,7 @@ Hook Execution Order
 ---------------------
 1. pytest_configure (tryfirst)
     - Loads Spyre plugins (custom ops, platform)
+    - Sizes this process's torch thread pool to the container's CPU budget
     - Detects local vLLM repo OR clones to ~/.cache/vllm-upstream-tests/
     - Injects test paths into pytest collection
 
@@ -54,12 +55,15 @@ UPSTREAM_TESTS_PATHS    Comma-separated paths (default: auto from YAML)
 VLLM_COMMIT             Override vLLM commit (default: from pyproject.toml)
 VLLM_REPO_URL           Override vLLM repo URL
 XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
+SPYRE_NUM_CPUS          CPU budget for the torch thread clamp (default: auto-detected)
+SPYRE_UPDATE_THREAD_CONFIG  Set to 0 to leave this process's torch thread pool alone
 """
 
 from __future__ import annotations
 
 import atexit
 import fnmatch
+import math
 import os
 import re
 import socket
@@ -69,7 +73,6 @@ import tempfile
 import time
 import tomllib
 import traceback
-import warnings
 from pathlib import Path
 
 import pytest
@@ -158,6 +161,32 @@ def _log(msg: str):
     else:
         # Fallback to stderr when terminal reporter not available
         print(msg, file=sys.stderr)
+
+
+def _clamp_torch_threads() -> None:
+    """Size this process's torch intra-op pool to the container's CPU budget.
+
+    libgomp reads OMP_NUM_THREADS once, when torch loads it, so `configure_threading`'s
+    env-var rewrite cannot resize a pool that already exists -- only torch can.
+    """
+    from spyre_inference import envs
+    from spyre_inference.threading_config import get_cpu_count
+
+    if not envs.SPYRE_UPDATE_THREAD_CONFIG:
+        return
+
+    cpu_count, detection_message = get_cpu_count()
+    if cpu_count is None:
+        _log("[threads] No CPU budget detected, leaving torch intra-op threads alone")
+        return
+
+    # floor, unlike configure_threading's ceiling, which must not leave a worker at zero.
+    threads = max(1, math.floor(cpu_count))
+    current = torch.get_num_threads()
+    if threads >= current:
+        return
+    _log(f"[threads] {detection_message}: torch intra-op threads {current} -> {threads}")
+    torch.set_num_threads(threads)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +568,8 @@ def pytest_configure(config):
 
     load_general_plugins()
 
+    _clamp_torch_threads()
+
     # Register sharding for its own trylast pytest_collection_modifyitems, which must
     # land after pytest's -m deselection. Registered here (not via the plugin's -p
     # entry) and before the upstream return so it applies to `not upstream` shard jobs.
@@ -686,15 +717,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 for tag in allow_entry.tags:
                     item.add_marker(getattr(pytest.mark, tag))
 
-                if item.name in {
-                    "test_gsm8k_correctness[granite-4.1-3b]",
-                    "test_gsm8k_correctness[mistral-7b-instruct-v0.3]",
-                    "test_gsm8k_correctness[qwen2.5-0.5b-instruct]",
-                    "test_models[ibm-ai-platform/micro-g3.3-8b-instruct-1b-transformers-num_fused0]",
-                    "test_models[meta-llama/Llama-3.2-1B-Instruct-transformers-num_fused1]",
-                }:
-                    item.add_marker(pytest.mark.disable_co_optimizing_lx_planning)
-
             if allow_entry is None:
                 item.add_marker(pytest.mark.skip(reason="not in allow_list"))
                 continue
@@ -744,21 +766,6 @@ def _reorder_tests_by_name(items: list[pytest.Item]) -> None:
         return (priority, stable_map[item])
 
     items.sort(key=sort_key)
-
-
-@pytest.fixture(autouse=True)
-def _disable_co_optimizing_lx_planning(request, monkeypatch):
-    if request.node.get_closest_marker("disable_co_optimizing_lx_planning") is None:
-        return
-
-    monkeypatch.setenv("CO_OPTIMIZING_LX_PLANNING", "0")
-    warnings.warn(
-        "Temporarily forcing CO_OPTIMIZING_LX_PLANNING=0 for this slow-compiling test. "
-        "Remove the disable_co_optimizing_lx_planning marker once torch-spyre makes "
-        "co-optimized planning affordable again (torch-spyre#4455).",
-        UserWarning,
-        stacklevel=1,
-    )
 
 
 def _convert_yaml_value(value):

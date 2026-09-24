@@ -110,17 +110,7 @@ def _generate(
 
 
 @pytest.mark.multimodal
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(
-            False,
-            id="compiled",
-            marks=pytest.mark.disable_co_optimizing_lx_planning,
-        ),
-    ],
-)
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
@@ -146,6 +136,25 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
+    """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
+
+    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
+    avoiding unrelated first-use compiles in the vision tower.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    (text,) = _generate([_conversation()], enforce_eager=False)
+
+    assert text.strip(), "empty text-only generation from the multimodal model"
+
+
+@pytest.mark.multimodal
+@pytest.mark.uses_subprocess
 def test_two_image_prompt_produces_output():
     """Two images make the vision mask non-trivial: a pair of strided sub-block writes
     rather than one full-range write, which is what `patch_block_attention_mask` is for.
@@ -164,17 +173,7 @@ def test_two_image_prompt_produces_output():
 
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(
-            False,
-            id="compiled",
-            marks=pytest.mark.disable_co_optimizing_lx_planning,
-        ),
-    ],
-)
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the

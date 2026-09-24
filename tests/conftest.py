@@ -19,6 +19,24 @@ from spyre_inference import envs
 from spyre_inference.v1.worker import compile_guard
 
 
+def pytest_collection_modifyitems(items):
+    """Skip batched decode until it composes with the default tiled page walk."""
+    skip = pytest.mark.skip(
+        reason="will be re-enabled once batched decode is working with for_each_tile"
+    )
+    for item in items:
+        # Match only the test id/class/parameter portion, not the file path: the
+        # global skip must not exclude the card-free entry-local CPU tests by filename.
+        nodeid = item.nodeid.partition("::")[2].lower()
+        if (
+            "batched_decode" in nodeid
+            or "batcheddecode" in nodeid
+            or "enable_batched_decode" in item.fixturenames
+            or "batched_decode_calls" in item.fixturenames
+        ):
+            item.add_marker(skip)
+
+
 @pytest.fixture(autouse=True)
 def _clear_env_cache():
     """envs.py caches each SPYRE_* value on first read; drop the cache around

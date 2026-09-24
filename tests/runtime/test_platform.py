@@ -206,30 +206,98 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
-    """Pooling body T lives on compile_sizes; attention L is independent."""
+def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):
     from unittest.mock import MagicMock
 
     from vllm.config import CompilationMode
 
-    from spyre_inference.platform import TorchSpyrePlatform
-
     vllm_config = MagicMock()
     vllm_config.model_config.enforce_eager = False
     vllm_config.model_config.runner_type = "pooling"
-    vllm_config.model_config.max_model_len = 512
-    vllm_config.scheduler_config.max_num_batched_tokens = 512
+    vllm_config.model_config.max_model_len = max_model_len
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     vllm_config.compilation_config.custom_ops = ["all"]
     # None requests pooling defaults. A MagicMock here is not None and would
     # skip that path (#638).
     vllm_config.compilation_config.compile_sizes = None
+    return vllm_config
+
+
+def test_apply_config_gives_pooling_one_body_shape():
+    """The whole point of fixing the body at the budget: one compile size, so the
+    encoder attention kernels key on the sequence shapes alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_batched_tokens=512)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    assert vllm_config.compilation_config.compile_sizes == [64, 128, 256, 512]
+    assert vllm_config.compilation_config.compile_sizes == [512]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 
-def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):
+@pytest.mark.parametrize("enforce_eager", [False, True], ids=["compiled", "eager"])
+def test_apply_config_caps_roberta_max_model_len_on_both_paths(enforce_eager):
+    """Eager pads to the declared length too, so an uncapped 514 would index two rows
+    past the position table on every full-length request."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=514)
+    vllm_config.model_config.enforce_eager = enforce_eager
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        architectures=["XLMRobertaForSequenceClassification"],
+        max_position_embeddings=514,
+        pad_token_id=1,
+        position_embedding_type="absolute",
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.model_config.max_model_len == 512
+
+
+def test_apply_config_floors_the_pooling_budget_at_max_model_len():
+    """Encoder prefill cannot be chunked, so a budget below max_model_len would
+    head-of-line block the scheduler forever."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=256)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+    assert vllm_config.compilation_config.compile_sizes == [512]
+
+
+def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=8192)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+
+
+def test_apply_config_clamps_pooling_max_num_seqs_to_the_widest_rectangle():
+    """``max_num_seqs`` above ``budget // 64`` asks for a batch no rectangle holds."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_seqs=64, max_num_batched_tokens=512)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_seqs == 8  # 512 // 64
+
+
+def test_apply_config_leaves_a_fitting_pooling_max_num_seqs_alone():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_seqs=4, max_num_batched_tokens=2048)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_seqs == 4
+
+
+def _fake_pad_config(
+    head_dim=64,
+    num_heads=8,
+    *,
+    transformers_backend=False,
+    runner_type="generate",
+    **rope_attrs,
+):
     """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
 
     hf_config and hf_text_config share one object (the common case). Returns
@@ -246,6 +314,7 @@ def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **
         hf_text_config=hf_config,
         model_arch_config=SimpleNamespace(head_size=head_dim),
         using_transformers_backend=lambda: transformers_backend,
+        runner_type=runner_type,
     )
     return SimpleNamespace(model_config=model_config), hf_config, model_config
 
@@ -345,6 +414,41 @@ def test_pad_head_dim_aligned_model_with_rope_dim_not_rejected():
     TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)  # returns early, no raise
 
     assert hf.head_dim == 128
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_pools_a_sub_stick_non_rope_model():
+    """granite-embedding-30m-english shape: no RoPE, pooling, head_dim 32 -> 64
+    (not 128 -- the RoPE path's width doesn't apply here)."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(head_dim=32, num_heads=12, runner_type="pooling")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
+    assert hf._spyre_orig_head_dim == 32
+    assert mc.model_arch_config.head_size == 64
+
+
+def test_pad_head_dim_skips_a_non_rope_non_pooling_model():
+    """OPT/GPT-2 shape: no RoPE, not pooling -> untouched, as before."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(head_dim=32, num_heads=12, runner_type="generate")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 32
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_skips_an_already_aligned_pooling_model():
+    """head_dim already a 64-multiple (e.g. granite-embedding-125m) -> no-op."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(head_dim=64, num_heads=12, runner_type="pooling")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
     assert not hasattr(hf, "_spyre_orig_head_dim")
 
 

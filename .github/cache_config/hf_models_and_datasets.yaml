@@ -30,6 +30,10 @@ public_models:
     revision: 3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3
   - repo: sentence-transformers/all-roberta-large-v1
     revision: cf74d8acd4f198de950bf004b262e6accfed5d2c
+  - repo: ibm-granite/granite-embedding-30m-english
+    revision: 9b5b096411652ec1189c68fcfb90d0a82c5b45af
+  - repo: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
   - repo: BAAI/bge-reranker-v2-m3
     revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
   - repo: BAAI/bge-reranker-large

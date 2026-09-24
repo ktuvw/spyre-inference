@@ -447,3 +447,93 @@ def test_text_backbone_attention_shimmed_when_in_separate_module(monkeypatch):
         "GraniteAttention in the text backbone module must be shimmed by the "
         "text_archs loop; without the PR fix it would remain at the native width"
     )
+
+
+# Raw HF names: separate Q/K/V tensors, no RoPE. 32->64 is the actual shape
+# this dispatch exists for (granite-embedding-30m-english).
+_BERT_ORIG, _BERT_PADDED, _BERT_HEADS = 32, 64, 12
+
+
+def test_pad_weight_bert_qkv_end_pad_no_interleave():
+    """No RoPE, so Q gets the plain end-pad too, unlike the decoder's Q branch."""
+    hidden = 384
+    w = torch.arange(float(_BERT_HEADS * _BERT_ORIG * hidden)).reshape(
+        _BERT_HEADS * _BERT_ORIG, hidden
+    )
+    for name in (
+        "encoder.layer.0.attention.self.query.weight",
+        "encoder.layer.0.attention.self.key.weight",
+        "encoder.layer.0.attention.self.value.weight",
+    ):
+        out = _pad_weight(name, w, _BERT_HEADS, _BERT_HEADS, _BERT_ORIG, _BERT_PADDED)
+        assert out.shape == (_BERT_HEADS * _BERT_PADDED, hidden)
+        out = out.view(_BERT_HEADS, _BERT_PADDED, hidden)
+        src = w.view(_BERT_HEADS, _BERT_ORIG, hidden)
+        assert torch.equal(out[:, :_BERT_ORIG], src)
+        assert not out[:, _BERT_ORIG:].any()
+
+    bias = torch.arange(float(_BERT_HEADS * _BERT_ORIG))
+    out_bias = _pad_weight(
+        "encoder.layer.0.attention.self.query.bias",
+        bias,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+    assert out_bias.shape == (_BERT_HEADS * _BERT_PADDED,)
+
+
+def test_pad_weight_bert_attention_output_dense_input_end_pad():
+    hidden = 384
+    w = torch.arange(float(hidden * _BERT_HEADS * _BERT_ORIG)).reshape(
+        hidden, _BERT_HEADS * _BERT_ORIG
+    )
+    out = _pad_weight(
+        "encoder.layer.0.attention.output.dense.weight",
+        w,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+    assert out.shape == (hidden, _BERT_HEADS * _BERT_PADDED)
+    out = out.view(hidden, _BERT_HEADS, _BERT_PADDED)
+    src = w.view(hidden, _BERT_HEADS, _BERT_ORIG)
+    assert torch.equal(out[:, :, :_BERT_ORIG], src)
+    assert not out[:, :, _BERT_ORIG:].any()
+
+
+def test_pad_weight_bert_ffn_output_dense_left_alone():
+    """The FFN's own `output.dense` (BertOutput, no "attention." segment) must not
+    be mistaken for the attention output projection."""
+    hidden, intermediate = 384, 1536
+    w = torch.randn(hidden, intermediate)
+
+    out = _pad_weight(
+        "encoder.layer.0.output.dense.weight",
+        w,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+
+    assert torch.equal(out, w)
+
+
+def test_pad_weight_bert_attention_output_dense_bias_left_alone():
+    """Unlike the weight, the attention output bias is [hidden_size] already and
+    is unrelated to head_dim -- it must pass through untouched."""
+    bias = torch.randn(384)
+
+    out = _pad_weight(
+        "encoder.layer.0.attention.output.dense.bias",
+        bias,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+
+    assert torch.equal(out, bias)

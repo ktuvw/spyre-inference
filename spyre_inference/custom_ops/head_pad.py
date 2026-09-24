@@ -172,6 +172,16 @@ def _pad_weight(
     # QK-norm (Qwen3): pad only a norm taken over head_dim; other widths are untouched.
     if name.endswith(("q_norm.weight", "k_norm.weight")) and w.numel() == orig:
         return _pad_qk_norm_weight(w, orig, padded)
+    # Raw HF names (pre-WeightsMapper): three separate Q/K/V tensors, no RoPE.
+    # "attention.output.dense" (not bare "output.dense") excludes BertOutput's FFN.
+    if name.endswith(("attention.self.query.weight", "attention.self.query.bias")):
+        return _pad_output_end(w, n_heads, orig, padded)
+    if name.endswith(("attention.self.key.weight", "attention.self.key.bias")):
+        return _pad_output_end(w, n_kv_heads, orig, padded)
+    if name.endswith(("attention.self.value.weight", "attention.self.value.bias")):
+        return _pad_output_end(w, n_kv_heads, orig, padded)
+    if name.endswith("attention.output.dense.weight"):
+        return _pad_input_end(w, n_heads, orig, padded)
     return w
 
 
@@ -305,7 +315,8 @@ def verify_padded_head_dim(model, hf_config) -> None:
 
 
 def install_head_pad_weight_loader(model_loader, hf_config, model_config=None) -> None:
-    """Wrap ``model_loader.get_all_weights`` to pad q/k/v/o head_dim 64->128.
+    """Wrap ``model_loader.get_all_weights`` to pad q/k/v/o head_dim to the width
+    the platform chose (64->128 for RoPE decoders, 32->64 for pooling models).
 
     The transform runs on the raw ``(name, tensor)`` stream before vLLM's
     ``WeightsMapper`` and ``weight_loader`` (which ``.narrow`` and assert exact
