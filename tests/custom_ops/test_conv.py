@@ -173,6 +173,7 @@ def test_layouts_build_for_valid_shapes(out_ch, hw, batch):
 
 
 @pytest.mark.conv
+@pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize(
     "patch,height,width",
     [
@@ -184,48 +185,26 @@ def test_layouts_build_for_valid_shapes(out_ch, hw, batch):
     ],
 )
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias):
-    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`."""
+def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias, batch):
+    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`.
+
+    batch > 1 covers the SigLIP use-case where multiple images are conv'd in a
+    single forward pass.  The `_input_layout` batch dim (device dim 3, host
+    stride C*H*W) must produce the same result as independent per-image convolutions.
+    """
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     layer = _layer(kernel=patch, stride=patch, bias=use_bias)
 
     torch.manual_seed(3)
-    x = torch.randn(1, 3, height, width, dtype=torch.float16)
+    x = torch.randn(batch, 3, height, width, dtype=torch.float16)
     expected = F.conv2d(
         x,
         layer.weight.data,
         layer.bias.data if use_bias else None,
         stride=patch,
     )
-
-    layer = layer.to("spyre")
-    layer.process_weights_after_loading()
-    actual = layer.forward_oot(x.to("spyre"))
-
-    assert actual.shape == expected.shape
-    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
-
-
-@pytest.mark.conv
-@pytest.mark.parametrize("batch", [2, 4])
-def test_patch_conv_batched_matches_cpu_reference(batch):
-    """Batched on-card `F.conv2d` matches a plain CPU reference for B > 1.
-
-    This covers the SigLIP use-case where multiple images are conv'd in a single
-    forward pass.  The `_input_layout` batch dim (device dim 3, host stride C*H*W)
-    must produce the same result as independent per-image convolutions.
-    """
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    patch, height, width = 16, 64, 64
-    layer = _layer(kernel=patch, stride=patch, bias=False)
-
-    torch.manual_seed(5)
-    x = torch.randn(batch, 3, height, width, dtype=torch.float16)
-    expected = F.conv2d(x, layer.weight.data, stride=patch)
 
     layer = layer.to("spyre")
     layer.process_weights_after_loading()
