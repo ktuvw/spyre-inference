@@ -21,6 +21,7 @@ numeric tests need a card.
 """
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -147,6 +148,52 @@ def test_unsupported_patch_shape_falls_back_to_conv_not_mulmat():
     torch.testing.assert_close(layer.forward_oot(x), layer._forward_conv(x))
 
 
+@pytest.mark.conv
+@pytest.mark.parametrize("batch", [2, 3, 5])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_batched_patch_conv_does_not_stage_layouts(monkeypatch, batch, use_bias):
+    from spyre_inference.custom_ops import conv
+
+    layer = _layer(bias=use_bias)
+    x = SimpleNamespace(dim=lambda: 4, shape=(batch, 3, 64, 64), device=torch.device("spyre"))
+    expected = torch.empty(batch, OUT_CHANNELS, 4, 4)
+
+    def compiled(input_tensor, weight, bias):
+        assert input_tensor is x
+        assert weight is layer.weight
+        assert bias is layer.bias
+        return expected
+
+    def no_staging(*args, **kwargs):
+        pytest.fail("batched convolution must not stage tensors through CPU")
+
+    monkeypatch.setattr(layer, "_conv_native", compiled)
+    monkeypatch.setattr(conv, "convert", no_staging)
+    assert layer.forward_oot(x) is expected
+
+
+@pytest.mark.conv
+@pytest.mark.parametrize("in_ch,out_ch", [(65, OUT_CHANNELS), (3, 100)])
+def test_unsupported_batched_shape_keeps_fallback(monkeypatch, in_ch, out_ch):
+    from spyre_inference.custom_ops import conv
+
+    layer = _layer(in_ch=in_ch, out_ch=out_ch)
+    x = SimpleNamespace(dim=lambda: 4, shape=(2, in_ch, 64, 64), device=torch.device("spyre"))
+    expected = torch.empty(2, out_ch, 4, 4)
+
+    def fallback(input_tensor):
+        assert input_tensor is x
+        return expected
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("unsupported shapes must retain the original convolution fallback")
+
+    monkeypatch.setattr(layer, "_forward_conv", fallback)
+    monkeypatch.setattr(layer, "_conv_native", unexpected)
+    monkeypatch.setattr(conv, "convert", unexpected)
+    assert layer.forward_oot(x) is expected
+
+
 # ---------------------------------------------------------------------------
 # Layout derivation (needs torch-spyre, not necessarily a card)
 # ---------------------------------------------------------------------------
@@ -186,11 +233,10 @@ def test_layouts_build_for_valid_shapes(out_ch, hw, batch):
 )
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias, batch):
-    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`.
+    """Spyre `F.conv2d` matches a plain CPU `F.conv2d`.
 
     batch > 1 covers the SigLIP use-case where multiple images are conv'd in a
-    single forward pass.  The `_input_layout` batch dim (device dim 3, host
-    stride C*H*W) must produce the same result as independent per-image convolutions.
+    single forward pass without explicit layout staging.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")

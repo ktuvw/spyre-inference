@@ -16,9 +16,9 @@
 
 vLLM lowers a patch conv to im2col + GEMM, whose on-device reshape produces a
 sub-stick `copy_from_d2d` expression torch-spyre cannot lay out for patch grids
-coprime with the 64-wide stick. So run the real `F.conv2d` on-card instead, with
-the weight and input placed into explicit `SpyreTensorLayout`s. Layout tuples are
-derived from shapes, so any out-channel count, image size, and batch size work.
+coprime with the 64-wide stick. Use `F.conv2d` instead. Single-image calls retain
+explicit `SpyreTensorLayout`s; batched calls avoid staging layouts that the
+backend's CPU-unfold decomposition immediately discards.
 """
 
 import torch
@@ -82,7 +82,7 @@ def _input_layout(x: torch.Tensor):
 
 @Conv2dLayer.register_oot(name="Conv2dLayer")
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
-    """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card with explicit tiled layouts.
+    """Out-of-tree `F.conv2d` dispatch for Spyre vision patch embeddings.
 
     Spyre needs static shapes, so the kernel recompiles per distinct (H, W). Past
     ``torch._dynamo.config.cache_size_limit`` (default 8) dynamo falls back to
@@ -134,6 +134,9 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
                 tuple(self.weight.shape),
             )
             return self._forward_conv(x)
+        if x.shape[0] > 1:
+            # CPU unfold discards the tiled input layout, so do not stage it first.
+            return self._conv_native(x, self.weight, self.bias)
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
         # restickify would hit the same unsupported layout.
