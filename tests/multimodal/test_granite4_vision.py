@@ -649,10 +649,10 @@ def _narrow_staging_fill(ds_buffers, level_features_cpu, is_multimodal_cpu, N, l
 @pytest.mark.parametrize(
     "img_positions",
     [
-        [0, 3, 7],       # scattered with gaps
-        [1, 2, 5, 6],    # two contiguous pairs, separated
-        [0, 1, 2, 3],    # fully contiguous prefix
-        [4, 5, 6, 7],    # fully contiguous suffix
+        [0, 3, 7],  # scattered with gaps
+        [1, 2, 5, 6],  # two contiguous pairs, separated
+        [0, 1, 2, 3],  # fully contiguous prefix
+        [4, 5, 6, 7],  # fully contiguous suffix
     ],
     ids=["scattered", "two_pairs", "contiguous_prefix", "contiguous_suffix"],
 )
@@ -682,7 +682,9 @@ def test_narrow_staging_matches_full_buffer_staging(img_positions):
     ds_buffers_opt = [torch.zeros(max_tokens, lm_h, dtype=dtype) for _ in range(num_levels)]
 
     ref = _full_buffer_fill(ds_buffers_ref, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype)
-    opt = _narrow_staging_fill(ds_buffers_opt, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype)
+    opt = _narrow_staging_fill(
+        ds_buffers_opt, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype
+    )
 
     for lvl in range(num_levels):
         torch.testing.assert_close(
@@ -732,7 +734,9 @@ def test_patch_embed_input_ids_vision_path_fills_ds_buffers_scattered():
     is_multimodal_cpu = is_multimodal.clone()
 
     # Reference: full-buffer staging on identical fresh buffers.
-    ds_buffers_ref = [torch.zeros(_MAX_TOKENS, _LM_HIDDEN, dtype=torch.float16) for _ in range(_NUM_LEVELS)]
+    ds_buffers_ref = [
+        torch.zeros(_MAX_TOKENS, _LM_HIDDEN, dtype=torch.float16) for _ in range(_NUM_LEVELS)
+    ]
     ref = _full_buffer_fill(
         ds_buffers_ref, level_features_cpu, is_multimodal_cpu, N, _LM_HIDDEN, torch.float16
     )
