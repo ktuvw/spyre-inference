@@ -242,7 +242,6 @@ def test_interpolate_downsampler_patched_matches_stock():
 def test_interpolate_downsampler_non_integer_ratio_falls_back_to_cpu_path():
     """When orig_image_side % new_image_side != 0, the patch must fall back to
     the CPU-offloaded path and still produce numerically identical output."""
-    from fractions import Fraction
 
     from spyre_inference.multimodal.granite4_vision import patch_interpolate_downsampler
 
