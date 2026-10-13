@@ -59,9 +59,7 @@ def patch_interpolate_downsampler() -> None:
             # without aten::_adaptive_avg_pool2d or channel-first permutes.
             k = self.orig_image_side // self.new_image_side
             batch_size, _, dim = image_features.size()
-            x = image_features.view(
-                batch_size, self.new_image_side, k, self.new_image_side, k, dim
-            )
+            x = image_features.view(batch_size, self.new_image_side, k, self.new_image_side, k, dim)
             return x.mean(dim=(2, 4)).flatten(1, 2)
 
         # Non-integer ratio: fall back to the original CPU-offloaded path.
