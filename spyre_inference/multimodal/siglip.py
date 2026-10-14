@@ -12,7 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SigLIP vision-encoder workarounds for Spyre."""
+"""SigLIP vision-encoder workarounds for Spyre: boundary LayerNorms and vision-tower compile.
+
+Any boundary ``post_layernorm`` is swapped to ``SpyreLayerNorm`` to work around
+eager decomposition issues outside per-block compiled graphs.
+
+SigLIP so400m has head_dim=72 (not stick-aligned). ``patch_siglip_attention``
+zero-extends each head block of qkv_proj and out_proj from 72→128 and replaces
+SiglipAttention.forward to call ``padded_sdpa`` directly.
+
+The vision tower's encoder layers are marked for the runner's per-block compile via
+``mark_blocks_compilable``. Their body builds nothing on the host once SigLIP attention
+uses ``padded_sdpa`` (or ``SpyreMMEncoderAttention`` for stick-aligned models).
+``patch_vision_tower`` takes the tower itself, not the model, so a model that embeds
+a SigLIP tower (like Granite Vision) can reuse it.
+"""
 
 from __future__ import annotations
 
@@ -22,8 +36,9 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
+from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa
+from spyre_inference.multimodal.utils import STICK, align_up, mark_blocks_compilable, padded_sdpa
 
 logger = init_logger(__name__)
 
@@ -196,6 +211,72 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
     )
 
 
+def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.nn.LayerNorm:
+    new_ln = SpyreLayerNorm(
+        list(ln.normalized_shape),
+        eps=ln.eps,
+        elementwise_affine=ln.elementwise_affine,
+        bias=ln.bias is not None,
+    ).to(device=device, dtype=ln.weight.dtype if ln.elementwise_affine else torch.float16)
+    if ln.elementwise_affine:
+        with torch.no_grad():
+            new_ln.weight.copy_(ln.weight)
+            if ln.bias is not None:
+                new_ln.bias.copy_(ln.bias)
+    return new_ln
+
+
+def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
+    """Swap a SigLIP vision tower's boundary LayerNorms and mark its encoder
+    layers compilable."""
+    post_ln = getattr(tower, "post_layernorm", None)
+    if isinstance(post_ln, torch.nn.LayerNorm):
+        tower.post_layernorm = _to_spyre_layer_norm(post_ln, device)
+
+    vm = getattr(tower, "vision_model", tower)
+    if vm is not tower:
+        vm_post_ln = getattr(vm, "post_layernorm", None)
+        if isinstance(vm_post_ln, torch.nn.LayerNorm):
+            vm.post_layernorm = _to_spyre_layer_norm(vm_post_ln, device)
+
+    encoder = getattr(vm, "encoder", vm)
+    layers = getattr(encoder, "layers", None)
+    if not layers:
+        return
+
+    # Deferred: vit_attn imports this package's utils, so a top-level import is a cycle.
+    from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
+
+    try:
+        from vllm.model_executor.models.siglip import SiglipAttention
+    except ImportError:
+        SiglipAttention = None
+
+    patched = (
+        SiglipAttention is not None
+        and getattr(SiglipAttention.forward, "_spyre_patched", False)
+    )
+    attns = [getattr(getattr(layer, "self_attn", None), "attn", None) for layer in layers]
+    if patched or all(isinstance(attn, SpyreMMEncoderAttention) for attn in attns):
+        mark_blocks_compilable(layers)
+    else:
+        logger.warning_once(
+            "Spyre: SigLIP vision layers do not use SpyreMMEncoderAttention or patched forward; "
+            "the tower stays eager."
+        )
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Apply SigLIP vision workarounds."""
+    """Apply SigLIP vision workarounds and mark its encoder layers compilable."""
     patch_siglip_attention(model)
+
+    vision_tower = getattr(model, "vision_tower", None)
+    if vision_tower is not None:
+        patch_vision_tower(vision_tower, device)
+
+    vision_model = getattr(model, "vision_model", None)
+    if vision_model is not None:
+        patch_vision_tower(vision_model, device)
+
+    if vision_tower is None and vision_model is None:
+        patch_vision_tower(model, device)

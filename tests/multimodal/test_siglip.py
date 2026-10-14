@@ -353,5 +353,120 @@ def test_patch_siglip_attention_scale_uses_orig_head_dim():
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
+# ---------------------------------------------------------------------------
+# 2. patch_vision_tower — mark encoder layers compilable & swap boundary norm
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_siglip_layer(
+    num_heads: int = _NUM_HEADS_SIGLIP,
+    head_dim: int = _ORIG_HEAD_DIM,
+) -> nn.Module:
+    """Fake SiglipEncoderLayer with self_attn."""
+    layer = nn.Module()
+    layer.self_attn = _make_fake_siglip_attention(num_heads, head_dim)
+    return layer
+
+
+def _make_fake_siglip_vision_tower(
+    num_layers: int = 3,
+    with_post_norm: bool = True,
+    hidden_size: int = _HIDDEN_SIGLIP,
+) -> nn.Module:
+    """Fake SiglipVisionModel stand-in."""
+    g = torch.Generator(device="cpu").manual_seed(0)
+    tower = nn.Module()
+    tower.vision_model = nn.Module()
+    tower.vision_model.encoder = nn.Module()
+    tower.vision_model.encoder.layers = nn.ModuleList(
+        [_make_fake_siglip_layer() for _ in range(num_layers)]
+    )
+    if with_post_norm:
+        tower.vision_model.post_layernorm = torch.nn.LayerNorm(hidden_size)
+        tower.vision_model.post_layernorm.weight.data.normal_(generator=g)
+        tower.vision_model.post_layernorm.bias.data.normal_(generator=g)
+    else:
+        tower.vision_model.post_layernorm = None
+    return tower
+
+
+@pytest.mark.siglip
+@pytest.mark.usefixtures("_restore_siglip_attention_forward")
+def test_patch_vision_tower_marks_encoder_layers_compilable():
+    """`patch_vision_tower` must mark SiglipEncoderLayer blocks compilable when
+    SiglipAttention is patched."""
+    from spyre_inference.multimodal.siglip import (
+        patch_siglip_attention,
+        patch_vision_tower,
+    )
+    from spyre_inference.multimodal.utils import blocks_marked_compilable
+
+    tower = _make_fake_siglip_vision_tower()
+    patch_siglip_attention(tower)
+    patch_vision_tower(tower, torch.device("cpu"))
+
+    assert blocks_marked_compilable(tower.vision_model.encoder.layers)
+
+
+@pytest.mark.siglip
+@pytest.mark.usefixtures("_restore_siglip_attention_forward")
+def test_patch_vision_tower_swaps_boundary_post_layernorm():
+    """`patch_vision_tower` must swap boundary post_layernorm to SpyreLayerNorm."""
+    from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+    from spyre_inference.multimodal.siglip import (
+        patch_siglip_attention,
+        patch_vision_tower,
+    )
+
+    tower = _make_fake_siglip_vision_tower(with_post_norm=True)
+    orig_w = tower.vision_model.post_layernorm.weight.clone()
+    orig_b = tower.vision_model.post_layernorm.bias.clone()
+
+    patch_siglip_attention(tower)
+    patch_vision_tower(tower, torch.device("cpu"))
+
+    assert isinstance(tower.vision_model.post_layernorm, SpyreLayerNorm)
+    torch.testing.assert_close(tower.vision_model.post_layernorm.weight, orig_w)
+    torch.testing.assert_close(tower.vision_model.post_layernorm.bias, orig_b)
+
+
+@pytest.mark.siglip
+def test_patch_vision_tower_leaves_unsupported_attn_eager():
+    """Without patched SiglipAttention or SpyreMMEncoderAttention, encoder layers
+    stay eager (un-marked)."""
+    from spyre_inference.multimodal.siglip import patch_vision_tower
+    from spyre_inference.multimodal.utils import blocks_marked_compilable
+
+    tower = nn.Module()
+    tower.vision_model = nn.Module()
+    tower.vision_model.encoder = nn.Module()
+
+    class _OtherBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = nn.Module()
+            self.self_attn.attn = nn.Module()
+
+    tower.vision_model.encoder.layers = nn.ModuleList([_OtherBlock() for _ in range(2)])
+    patch_vision_tower(tower, torch.device("cpu"))
+
+    assert not any(blocks_marked_compilable([b]) for b in tower.vision_model.encoder.layers)
+
+
+@pytest.mark.siglip
+@pytest.mark.usefixtures("_restore_siglip_attention_forward")
+def test_apply_marks_siglip_vision_tower_blocks():
+    """`apply(model, device)` must pad attention and mark vision tower encoder layers compilable."""
+    from spyre_inference.multimodal.siglip import apply
+    from spyre_inference.multimodal.utils import blocks_marked_compilable
+
+    model = nn.Module()
+    model.vision_tower = _make_fake_siglip_vision_tower()
+
+    apply(model, torch.device("cpu"))
+
+    assert blocks_marked_compilable(model.vision_tower.vision_model.encoder.layers)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
