@@ -45,6 +45,9 @@ _ADAPTED_ARCHS: dict[str, str] = {
     # its language model through the registry as Gemma4ForCausalLM, which resolves here,
     # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Granite4VisionForConditionalGeneration": (
+        "spyre_inference.models.granite4_vision:SpyreGranite4VisionForConditionalGeneration"
+    ),
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
